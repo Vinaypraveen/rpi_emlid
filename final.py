@@ -1,4 +1,3 @@
-
 import websocket
 import threading
 import socket
