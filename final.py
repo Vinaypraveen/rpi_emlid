@@ -1,3 +1,4 @@
+
 import websocket
 import threading
 import socket
@@ -11,8 +12,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from flask import Flask, send_file
 import simplekml
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
+import shutil
 
 ws_url = "ws://192.168.2.15/socket.io/?EIO=3&transport=websocket"
 android_ip = "192.168.144.100"
@@ -29,9 +31,9 @@ generated_image_path = None
 #    /media/vinlee/EMLID_LOGS/Reach_20241105070819_events (5).kml
 
 app = Flask(__name__)
-destination = "/home/vinlee/Desktop/H30/Emlid_log_files"
-if not os.path.exists(destination):
-    os.makedirs(destination)
+destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
+if not os.path.exists(destination_dir):
+    os.makedirs(destination_dir)
 
 post_payload = {
     "started": False,
@@ -69,7 +71,7 @@ reboot_payload = [
             }
         ]
 
-def check_and_return_folder_path():
+def pendrive__check_and_copy_path():
     # Define the mount point
     mount_point = "/media/vinlee"
 
@@ -94,21 +96,31 @@ def check_and_return_folder_path():
         print("No pendrive attached.")
         return None
 
-
 @app.route('/download_image', methods=['GET'])
 def download_image():
     global generated_image_path
-    if generated_image_path and os.path.exists(generated_image_path):
-        # Extract the original filename
-        original_filename = os.path.basename(generated_image_path)
-        # Add Content-Disposition header to specify the filename
-        return send_file(
-            generated_image_path,
-            as_attachment=True,
-            download_name=original_filename  # Ensure filename is passed in the header
-        )
-    else:
-        return "Image not available yet or path is invalid.", 404
+    
+    # Retry mechanism to check for hardware reconnection
+    retries = 3  # Number of retries before failing
+    retry_delay = 2  # Delay between retries (in seconds)
+
+    while retries > 0:
+        if generated_image_path and os.path.exists(generated_image_path):
+            # Extract the original filename
+            original_filename = os.path.basename(generated_image_path)
+            # Add Content-Disposition header to specify the filename
+            return send_file(
+                generated_image_path,
+                as_attachment=True,
+                download_name=original_filename  # Ensure filename is passed in the header
+            )
+        else:
+            print("Image not available or path is invalid. Retrying...")
+            time.sleep(retry_delay)
+            retries -= 1
+
+    # After retries, return an error if the image is still not available
+    return "Image not available yet or path is invalid.", 404
 
 def check_logging_status():
     try:
@@ -175,15 +187,36 @@ def get_log_by_name(log_name, timeout=30):
 
 def process_log(Compressing_log_name):
     print(Compressing_log_name)
-    destination_dir = "/home/vinlee/Desktop/H30/Emlid_log_files"
     global generated_image_path
+    global destination_dir
+
+    if Compressing_log_name.startswith("Reach_"):
+        date_time_str = Compressing_log_name.split("Reach_")[1]
+        log_datetime_gmt = datetime.strptime(date_time_str, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        log_start_time = log_datetime_gmt + timedelta(hours=5, minutes=30)
+        print(f"Extracted Date and Time: {log_start_time}")
+        date_folder = os.path.join(destination_dir, log_start_time.strftime("%d-%m-%Y"))
+        time_folder = os.path.join(date_folder, log_start_time.strftime("%I-%M-%S %p"))  # 12-hour format with AM/PM
+        
+        # Check and create date folder if not exists
+        if not os.path.exists(date_folder):
+            os.makedirs(date_folder)
+            print(f"Created date folder: {date_folder}")
+        
+        # Check and create time folder if not exists
+        if not os.path.exists(time_folder):
+            os.makedirs(time_folder)
+            print(f"Created time folder: {time_folder}")
+    else:
+        print("Invalid log name format.")
+        return
 
     log_name = Compressing_log_name + ".zip"
     log_entry = get_log_by_name(log_name)
     if not log_entry:
         print("Log not found.")
         return
-    extract_to_dir,Log_IST_start_time,Log_recording_time,log_name = download_log_resumable(log_entry, destination_dir)
+    extract_to_dir,Log_IST_start_time,Log_recording_time,log_name = download_log_resumable(log_entry, time_folder)
     if not extract_to_dir:
         message = f"log_feedback,Downloaded File is Corrupted"
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
@@ -200,6 +233,22 @@ def process_log(Compressing_log_name):
             message = f"log_feedback,Download the Image"
             udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
             print(f"Image path updated to: {generated_image_path}")
+            time.sleep(2)
+             # Copy processed files to the pendrive
+            pendrive_path = pendrive__check_and_copy_path()
+            if pendrive_path:
+                pendrive_target = os.path.join(pendrive_path, log_start_time.strftime("%d-%m-%Y"), log_start_time.strftime("%I-%M-%S %p"))
+                if not os.path.exists(pendrive_target):
+                    os.makedirs(pendrive_target)
+                    print(f"Created target folder on pendrive: {pendrive_target}")
+                shutil.copytree(time_folder, pendrive_target, dirs_exist_ok=True)
+                print(f"Files copied to pendrive at: {pendrive_target}")
+                message = f"log_feedback,Log saved to Pendrive"
+                udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+            else:
+                print("Pendrive not available, files not copied.")
+                message = f"log_feedback,Pendrive not attached"
+                udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
 def extract_zip_file(zip_path, extract_to_dir):
     try:
@@ -317,43 +366,19 @@ def run_rnx2rtkp_command(rinex_files, output_dir, log_name):
         rinex_files["24P"]
     ]
 
+    #print(f"Running command: {' '.join(command)}")
     print("Running rnx2rtkp")
 
     try:
-        # Run the command and capture output
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        # Stream and send stdout and stderr in real-time
-        for line in iter(process.stdout.readline, ''):
-            message = f"STDOUT: {line.strip()}"
-            print(message)  # Print to console
-            udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))  # Send to UDP socket
-
-        for line in iter(process.stderr.readline, ''):
-            message = f"STDERR: {line.strip()}"
-            print(message)  # Print to console
-            udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))  # Send to UDP socket
-
-        # Wait for the process to complete
-        process.wait()
-
-        if process.returncode == 0:
-            print(f"rnx2rtkp done at '{output_file}'.")
-            message = f"log_feedback,Log Processed Successfully"
-            udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
-        else:
-            message = f"rnx2rtkp failed with return code {process.returncode}"
-            print(message)
-            udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+        # Run the command
+        subprocess.run(command, check=True)
+        print(f"rnx2rtkp done at '{output_file}'.")
+        message = f"log_feedback,Log Processed Succesfully"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+    except subprocess.CalledProcessError as e:
+        print(f"Error running rnx2rtkp: {e}")
     except FileNotFoundError:
-        message = "Error: rnx2rtkp command not found. Ensure it is installed and in your PATH."
-        print(message)
-        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
-    except Exception as e:
-        message = f"Unexpected error: {e}"
-        print(message)
-        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
-
+        print("Error: rnx2rtkp command not found. Ensure it is installed and in your PATH.")
 
 def find_rinex_files(directory):
     rinex_files = {"24O": None, "24P": None}
@@ -509,7 +534,6 @@ def listen_for_commands():
                     except Exception as e:
                         print("Error sending reboot command:", e)
 
-                
     except Exception as e:
         print(f"Error in listener: {e}")
     finally:
@@ -611,7 +635,14 @@ def on_message(ws, message):
         #print(f"Error processing message: {message}, Error: {e}")
 
 def start_flask_server():
-    app.run(host="192.168.144.20", port=5000, debug=False)
+    # Retry mechanism to handle hardware disconnection
+    while True:
+        try:
+            app.run(host="192.168.144.20", port=5000, debug=False)
+        except Exception as e:
+            print(f"Flask server encountered an error: {e}")
+            print("Retrying to start Flask server...")
+            time.sleep(2)  # Wait before retrying
 
 def send_ping(ws, interval=6):
     try:
@@ -667,6 +698,7 @@ def main():
     flask_thread = threading.Thread(target=start_flask_server, daemon=True)
     listener_thread.start()
     flask_thread.start()
+
     global ws
     ws = websocket.WebSocketApp(
         ws_url,
