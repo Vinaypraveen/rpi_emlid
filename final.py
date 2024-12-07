@@ -1,4 +1,3 @@
-
 import websocket
 import threading
 import socket
@@ -693,7 +692,44 @@ def retry_connection():
             print("Retry failed, waiting before next attempt:")
             time.sleep(5)  # Wait 5 seconds before retrying
 
+def ping_ip(ip):
+    """
+    Ping a given IP address to check if it is reachable.
+    Returns True if the ping is successful, False otherwise.
+    """
+    try:
+        # Use the ping command (Linux/Unix/Windows compatible)
+        response = subprocess.run(
+            ["ping", "-c", "1", ip] if os.name != "nt" else ["ping", "-n", "1", ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return response.returncode == 0
+    except Exception as e:
+        print(f"Error pinging IP {ip}: {e}")
+        return False
+
+def wait_for_ips(ip_list, retry_interval=5):
+    """
+    Wait until all IPs in the list respond to ping.
+    """
+    while True:
+        all_success = True
+        for ip in ip_list:
+            if not ping_ip(ip):
+                print(f"Ping to {ip} failed. Retrying in {retry_interval} seconds...")
+                all_success = False
+                break
+        if all_success:
+            print("All IPs are reachable. Proceeding with the program...")
+            return
+        time.sleep(retry_interval)
+
 def main():
+    ip_addresses = ["192.168.144.20", "192.168.2.15"]
+    print("Checking connectivity to required IPs...")
+    wait_for_ips(ip_addresses)
+
     listener_thread = threading.Thread(target=listen_for_commands, daemon=True)
     flask_thread = threading.Thread(target=start_flask_server, daemon=True)
     listener_thread.start()
