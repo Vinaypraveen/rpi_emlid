@@ -698,7 +698,6 @@ def ping_ip(ip):
     Returns True if the ping is successful, False otherwise.
     """
     try:
-        # Use the ping command (Linux/Unix/Windows compatible)
         response = subprocess.run(
             ["ping", "-c", "1", ip] if os.name != "nt" else ["ping", "-n", "1", ip],
             stdout=subprocess.DEVNULL,
@@ -709,26 +708,45 @@ def ping_ip(ip):
         print(f"Error pinging IP {ip}: {e}")
         return False
 
-def wait_for_ips(ip_list, retry_interval=5):
+def check_http_status(url):
     """
-    Wait until all IPs in the list respond to ping.
+    Check if a given URL returns a 200 status code.
+    Returns True if status code is 200, False otherwise.
+    """
+    try:
+        response = requests.get(url)
+        return response.status_code == 200
+    except requests.exceptions.RequestException as e:
+        print(f"Error checking HTTP status for {url}: {e}")
+        return False
+
+def wait_for_conditions(ip_list, url, retry_interval=3):
+    """
+    Wait until all IPs respond to ping and the given URL returns a 200 status code.
     """
     while True:
-        all_success = True
-        for ip in ip_list:
-            if not ping_ip(ip):
-                print(f"Ping to {ip} failed. Retrying in {retry_interval} seconds...")
-                all_success = False
-                break
-        if all_success:
-            print("All IPs are reachable. Proceeding with the program...")
+        # Check ping for all IPs
+        all_ips_success = all(ping_ip(ip) for ip in ip_list)
+
+        # Check HTTP status for the specified URL
+        url_success = check_http_status(url)
+
+        if all_ips_success and url_success:
+            print("All IPs are reachable, and the webpage is available. Proceeding with the program...")
             return
+
+        if not all_ips_success:
+            print(f"Ping check failed for one or more IPs. Retrying in {retry_interval} seconds...")
+
+        if not url_success:
+            print(f"Webpage check for {url} failed. Retrying in {retry_interval} seconds...")
+
         time.sleep(retry_interval)
 
 def main():
     ip_addresses = ["192.168.144.20", "192.168.2.15"]
     print("Checking connectivity to required IPs...")
-    wait_for_ips(ip_addresses)
+    wait_for_conditions(ip_addresses, post_url)
 
     listener_thread = threading.Thread(target=listen_for_commands, daemon=True)
     flask_thread = threading.Thread(target=start_flask_server, daemon=True)
