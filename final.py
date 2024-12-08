@@ -448,6 +448,9 @@ def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_reco
 
     if data.empty:
         print("No valid data to plot.")
+        message = f"log_feedback,No valid data to plot"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+
         return None,None
 
     latitudes = data["Latitude"]
@@ -772,4 +775,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
