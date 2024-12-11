@@ -36,33 +36,18 @@ if not os.path.exists(destination_dir):
 
 post_payload = {
     "started": False,
-    "raw": {
-        "enabled": True,
-        "format": "RINEX",
-        "rinex_options": {
-            "logging_interval": 1,
-            "preset": "custom",
-            "satellite_systems": {
-                "gps": True,
-                "glonass": True,
-                "galileo": True,
-                "beidou": True,
-                "qzss": True,
-                "sbas": True
-            },
-            "time_adjustments_enabled": True
-        },
-        "version": "3.04"
-    }
 }
+
 last_sent_times = {
     "navigation": 0,
     "storage_status": 0
 }
+
 update_intervals = {
     "navigation": 2,
     "storage_status": 5
 }
+
 reboot_payload = [
             "action",
             {
@@ -412,6 +397,8 @@ def find_events_pos_file(directory, log_name):
                 return file_path
 
     print(f"Events file '{expected_file_name}' not found.")
+    message = f"Events file not found"
+    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     return None
 
 def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_recording_time,log_name):
@@ -775,3 +762,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
