@@ -27,8 +27,6 @@ archive_name_global = None
 Compressing_log_name = None
 generated_image_path = None
 
-#    /media/vinlee/EMLID_LOGS/Reach_20241105070819_events (5).kml
-
 app = Flask(__name__)
 destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
 if not os.path.exists(destination_dir):
@@ -366,13 +364,45 @@ def run_rnx2rtkp_command(rinex_files, output_dir, log_name):
 
 def find_rinex_files(directory):
     rinex_files = {"24O": None, "24P": None}
+    ubx_file = None
 
+    # Look for .ubx file first
     for root, _, files in os.walk(directory):
         for file in files:
-            if file.endswith(".24O"):
-                rinex_files["24O"] = os.path.join(root, file)
-            elif file.endswith(".24P"):
-                rinex_files["24P"] = os.path.join(root, file)
+            if file.endswith(".UBX"):
+                ubx_file = os.path.join(root, file)
+                break  # Only process the first .ubx file found
+
+    if ubx_file:
+        print(f"Found .ubx file: {ubx_file}")
+        base_name = os.path.splitext(ubx_file)[0]  # Remove .ubx extension
+        output_24o = f"{base_name}.24O"
+        output_24p = f"{base_name}.24P"
+
+        # Run convbin command
+        try:
+            subprocess.run([
+                "convbin", ubx_file,
+                "-r", "ubx",
+                "-o", output_24o,
+                "-n", output_24p
+            ], check=True)
+
+            rinex_files["24O"] = output_24o
+            rinex_files["24P"] = output_24p
+            print(f"Generated .24O file: {output_24o}")
+            print(f"Generated .24P file: {output_24p}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error during conversion with convbin: {e}")
+    else:
+        # If no .ubx file is found, search for .24O and .24P files
+        print("No .ubx file found. Searching for .24O and .24P files.")
+        for root, _, files in os.walk(directory):
+            for file in files:
+                if file.endswith(".24O"):
+                    rinex_files["24O"] = os.path.join(root, file)
+                elif file.endswith(".24P"):
+                    rinex_files["24P"] = os.path.join(root, file)
 
     if rinex_files["24O"]:
         print(f"Found .24O file: {rinex_files['24O']}")
@@ -450,7 +480,7 @@ def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_reco
 
     # Generate and save the scatter plot
     plt.figure(figsize=(14, 10), dpi=300)
-    plt.scatter(longitudes, latitudes, s=3, color='red')
+    plt.scatter(longitudes, latitudes, s=4, color='red')
     plt.title(
         f"{log_name} , IMAGE COUNT : {len(latitudes)}\nDate & Time: {Log_IST_start_time}   Recording Time: {Log_recording_time}",
         fontsize=20,
@@ -458,7 +488,9 @@ def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_reco
     )
     plt.xlabel("Longitude", fontsize=12)
     plt.ylabel("Latitude", fontsize=12)
-    plt.grid(False)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.2)
+    plt.axis('equal')  # Enforce equal scaling for lat/lon
+    plt.tight_layout()  # Ensure all elements fit properly
     plt.savefig(output_image_path, dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -762,5 +794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
