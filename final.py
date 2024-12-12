@@ -370,7 +370,7 @@ def run_rnx2rtkp_command(rinex_files, output_dir, log_name):
     # Build the command
     command = [
         "rnx2rtkp",
-        "-k", "/home/vinlee/emlid_rpi.conf",
+        "-k", "/home/vinlee/rpi_emlid/emlid_rpi.conf",
         "-o", output_file,
         rinex_files["24O"],
         rinex_files["24P"]
