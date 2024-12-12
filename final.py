@@ -553,7 +553,7 @@ def listen_for_commands():
             message = data.decode('utf-8').strip()
             print(f"Received message: '{message}' from {addr}")
 
-            if message in ["start", "stop", "reboot"]:
+            if message in ["start", "stop", "reboot", "copy"]:
                 is_running = check_logging_status()
                 if message == "start":
                     if is_running:
