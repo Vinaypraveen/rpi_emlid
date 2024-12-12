@@ -26,6 +26,7 @@ last_time_marks_last_time = None
 archive_name_global = None
 Compressing_log_name = None
 generated_image_path = None
+log_start_time = None
 
 app = Flask(__name__)
 destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
@@ -52,31 +53,6 @@ reboot_payload = [
                 "name": "reboot"
             }
         ]
-
-def pendrive__check_and_copy_path():
-    # Define the mount point
-    mount_point = "/media/vinlee"
-
-    # Check if the mount point exists
-    if os.path.exists(mount_point):
-        # Get a list of directories in the mount point
-        directories = [os.path.join(mount_point, d) for d in os.listdir(mount_point) if os.path.isdir(os.path.join(mount_point, d))]
-        if directories:
-            for directory in directories:
-                emlid_logs_path = os.path.join(directory, "Emlid Logs")
-                if not os.path.exists(emlid_logs_path):
-                    # Create the folder if it doesn't exist
-                    os.makedirs(emlid_logs_path)
-                    print(f"'Emlid Logs' folder created at: {emlid_logs_path}")
-                else:
-                    print(f"'Emlid Logs' folder already exists at: {emlid_logs_path}")
-                return emlid_logs_path
-        else:
-            print("No directories found in the pendrive.")
-            return None
-    else:
-        print("No pendrive attached.")
-        return None
 
 @app.route('/download_image', methods=['GET'])
 def download_image():
@@ -171,6 +147,7 @@ def process_log(Compressing_log_name):
     print(Compressing_log_name)
     global generated_image_path
     global destination_dir
+    global log_start_time
 
     if Compressing_log_name.startswith("Reach_"):
         date_time_str = Compressing_log_name.split("Reach_")[1]
@@ -217,20 +194,71 @@ def process_log(Compressing_log_name):
             print(f"Image path updated to: {generated_image_path}")
             time.sleep(2)
              # Copy processed files to the pendrive
-            pendrive_path = pendrive__check_and_copy_path()
-            if pendrive_path:
-                pendrive_target = os.path.join(pendrive_path, log_start_time.strftime("%d-%m-%Y"), log_start_time.strftime("%I-%M-%S %p"))
-                if not os.path.exists(pendrive_target):
-                    os.makedirs(pendrive_target)
-                    print(f"Created target folder on pendrive: {pendrive_target}")
-                shutil.copytree(time_folder, pendrive_target, dirs_exist_ok=True)
-                print(f"Files copied to pendrive at: {pendrive_target}")
-                message = f"log_feedback,Log saved to Pendrive"
-                udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
-            else:
-                print("Pendrive not available, files not copied.")
-                message = f"log_feedback,Pendrive not attached"
-                udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+            copy_to_pendrive(log_start_time)
+            
+def copy_to_pendrive(log_start_time):
+    pendrive_path = pendrive__check_and_copy_path()
+    date_folder = os.path.join(destination_dir, log_start_time.strftime("%d-%m-%Y"))
+    time_folder = os.path.join(date_folder, log_start_time.strftime("%I-%M-%S %p"))
+
+    if not os.path.exists(time_folder):
+        print(f"Source folder does not exist: {time_folder}")
+        message = f"log_feedback,Source folder does not exist"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+        return
+
+    if not pendrive_path:
+        print("Pendrive path not detected. Aborting copy process.")
+        message = f"log_feedback,Pendrive not attached"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+        return
+
+    # Derive pendrive_target using relative paths
+    pendrive_target = os.path.join(pendrive_path, os.path.relpath(time_folder, destination_dir))
+
+    try:
+        for root, dirs, files in os.walk(time_folder):
+            for file in files:
+                src_file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(root, time_folder)
+                dest_dir = os.path.join(pendrive_target, relative_path)
+                if not os.path.exists(dest_dir):
+                    os.makedirs(dest_dir)
+                shutil.copy2(src_file_path, os.path.join(dest_dir, file))
+                print(f"Copied {file} to {os.path.join(dest_dir, file)}")
+
+        print(f"Files copied to pendrive at: {pendrive_target}")
+        message = f"log_feedback,Log saved to Pendrive"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+    except Exception as e:
+        print(f"Error copying files to pendrive: {e}")
+        message = f"log_feedback,Error saving to Pendrive"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+
+def pendrive__check_and_copy_path():
+    # Define the mount point
+    mount_point = "/media/vinlee"
+
+    # Check if the mount point exists
+    if os.path.exists(mount_point):
+        # Get a list of directories in the mount point
+        directories = [os.path.join(mount_point, d) for d in os.listdir(mount_point) if os.path.isdir(os.path.join(mount_point, d))]
+        if directories:
+            for directory in directories:
+                emlid_logs_path = os.path.join(directory, "Emlid Logs")
+                if not os.path.exists(emlid_logs_path):
+                    # Create the folder if it doesn't exist
+                    os.makedirs(emlid_logs_path)
+                    print(f"'Emlid Logs' folder created at: {emlid_logs_path}")
+                else:
+                    print(f"'Emlid Logs' folder already exists at: {emlid_logs_path}")
+                return emlid_logs_path
+        else:
+            print("No directories found in the pendrive.")
+            return None
+    else:
+        print("No pendrive attached.")
+        return None
 
 def extract_zip_file(zip_path, extract_to_dir):
     try:
@@ -514,6 +542,7 @@ def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_reco
 
 def listen_for_commands():
     global archive_name_global
+    global log_start_time
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     listener_sock.bind(("0.0.0.0", listener_port))
     print(f"Listening for 'stop' and 'start' messages on port {listener_port}...")
@@ -554,6 +583,13 @@ def listen_for_commands():
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                     except Exception as e:
                         print("Error sending reboot command:", e)
+                elif message == "copy":
+                    if log_start_time == None:
+                        feedback = "log_feedback,Log is not available for copy"
+                        udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
+                        print(feedback)
+                    else:
+                        copy_to_pendrive(log_start_time)
 
     except Exception as e:
         print(f"Error in listener: {e}")
