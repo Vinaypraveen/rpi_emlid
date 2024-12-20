@@ -14,6 +14,7 @@ import simplekml
 from datetime import datetime, timedelta, timezone
 import pytz
 import shutil
+from pymavlink import mavutil
 
 ws_url = "ws://192.168.2.15/socket.io/?EIO=3&transport=websocket"
 android_ip = "192.168.144.100"
@@ -27,6 +28,7 @@ archive_name_global = None
 Compressing_log_name = None
 generated_image_path = None
 log_start_time = None
+connection = None
 
 app = Flask(__name__)
 destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
@@ -53,6 +55,59 @@ reboot_payload = [
                 "name": "reboot"
             }
         ]
+
+def send_to_pixhawk(message: str, severity: int):
+    """
+    Sends a message to the Pixhawk with a specified severity level.
+
+    :param message: The message to send.
+    :param severity: Severity level (0 - Emergency, 7 - Debug).
+    """
+    global connection
+    try:
+        # Check if the connection is valid
+        if connection is None:
+            print("Connection is not established. Attempting to reconnect...")
+            connection = establish_connection(retries=3, delay=2)
+            if connection is None:
+                print("Failed to reconnect. Cannot send the message.")
+                return
+
+        # Send message if severity is valid
+        if 0 <= severity <= 7:
+            connection.mav.statustext_send(severity, message.encode('utf-8'))
+            print(f"Message sent: '{message}' with severity {severity}")
+        else:
+            print("Invalid severity level. Must be between 0 (Emergency) and 7 (Debug).")
+    except Exception as e:
+        print(f"Error while sending message: {e}")
+
+
+def establish_connection(retries=5, delay=2):
+    """
+    Establish a connection to the Pixhawk via serial with retries.
+    
+    :param retries: Number of retry attempts.
+    :param delay: Delay between retries in seconds.
+    :return: mavutil.mavlink_connection object if successful, None otherwise.
+    """
+    global connection
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"Attempt {attempt} to connect...")
+            connection = mavutil.mavlink_connection("/dev/ttyAMA0", baud=115200, source_system=1)
+            print("Waiting for heartbeat...")
+            connection.wait_heartbeat()
+            print(f"Heartbeat received from system (system {connection.target_system}, component {connection.target_component})")
+            return connection
+        except Exception as e:
+            print(f"Connection attempt {attempt} failed: {e}")
+            if attempt < retries:
+                print(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print("All connection attempts failed.")
+    return None
 
 @app.route('/download_image', methods=['GET'])
 def download_image():
@@ -97,12 +152,22 @@ def perform_post_request(started):
         post_payload["started"] = started
         response = requests.post(post_url, json=post_payload)
         if response.status_code == 200:
-            return f"log_feedback,{'Logging started successfully' if started else 'Logging stopped successfully'}"
+            if started:
+                log_feedback = "Logging started successfully"
+                send_to_pixhawk(log_feedback,0)
+            else:
+                log_feedback = "Logging stopped successfully"
+                send_to_pixhawk(log_feedback,0)
+            return f"log_feedback, {log_feedback}"
+        
         else:
             print(f"Failed to update logging. HTTP {response.status_code}")
+            send_to_pixhawk("Failed to update logging",0)
             return "log_feedback,Failed to update logging"
+        
     except requests.exceptions.RequestException as e:
         print("Error performing POST request:", e)
+        send_to_pixhawk("Error updating logging status",0)
         return "log_feedback,Error updating logging status"
 
 def get_log_by_name(log_name, timeout=30):
@@ -116,6 +181,7 @@ def get_log_by_name(log_name, timeout=30):
             if elapsed_time > timeout:
                 print(f"Timeout reached: Could not find log '{log_name}' within {timeout} seconds.")
                 message = f"log_feedback,Timeout reached: Log '{log_name}' not found."
+                send_to_pixhawk(f"Timeout reached: Log '{log_name}' not found",0)
                 udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                 return None
 
@@ -128,12 +194,9 @@ def get_log_by_name(log_name, timeout=30):
             for log_entry in logs_data:
                 if log_entry['name'] == log_name:
                     message = f"log_feedback,Downloading Log : {log_entry['name']}"
+                    send_to_pixhawk(f"Downloading Log : {log_entry['name']}",0)
                     udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                     return log_entry
-
-            # Log not found, retry after a delay
-            message = f"log_feedback,Compressing Log : '{log_name}'"
-            udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
         except requests.exceptions.RequestException as e:
             print(f"Error fetching logs: {e}. Retrying in {retry_interval} seconds...")
@@ -178,6 +241,7 @@ def process_log(Compressing_log_name):
     extract_to_dir,Log_IST_start_time,Log_recording_time,log_name = download_log_resumable(log_entry, time_folder)
     if not extract_to_dir:
         message = f"log_feedback,Downloaded File is Corrupted"
+        send_to_pixhawk("Downloaded File is Corrupted",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
@@ -190,6 +254,7 @@ def process_log(Compressing_log_name):
             generated_image_path = image_path  # Update the global path
             time.sleep(1)
             message = f"log_feedback,Download the Image"
+            send_to_pixhawk("Download the Image",0)
             udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
             print(f"Image path updated to: {generated_image_path}")
             time.sleep(2)
@@ -204,12 +269,14 @@ def copy_to_pendrive(log_start_time):
     if not os.path.exists(time_folder):
         print(f"Source folder does not exist: {time_folder}")
         message = f"log_feedback,Source folder does not exist"
+        send_to_pixhawk("Source folder does not exist",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
     if not pendrive_path:
         print("Pendrive path not detected. Aborting copy process.")
         message = f"log_feedback,Pendrive not attached"
+        send_to_pixhawk("Pendrive not attached",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
@@ -229,10 +296,12 @@ def copy_to_pendrive(log_start_time):
 
         print(f"Files copied to pendrive at: {pendrive_target}")
         message = f"log_feedback,Log saved to Pendrive"
+        send_to_pixhawk("Log saved to Pendrive",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     except Exception as e:
         print(f"Error copying files to pendrive: {e}")
         message = f"log_feedback,Error saving to Pendrive"
+        send_to_pixhawk("Error saving to Pendrive",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
 def pendrive__check_and_copy_path():
@@ -346,9 +415,10 @@ def download_log_resumable(log_entry, destination_dir):
         end_time = time.time()  # End the timer
         print(f"\n\nLog file '{log_name}' downloaded successfully")
         print(f"Total download time: {end_time - start_time:.2f} seconds")
-        time.sleep(1)
         message = f"Total download time: {end_time - start_time:.2f} seconds"
+        send_to_pixhawk(message,0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+        time.sleep(1)
         # Extract the ZIP file
         extract_to_dir = os.path.join(destination_dir, log_name.replace('.zip', ''))
         extract_zip_file(destination_path, extract_to_dir)
@@ -384,6 +454,7 @@ def run_rnx2rtkp_command(rinex_files, output_dir, log_name):
         subprocess.run(command, check=True)
         print(f"rnx2rtkp done at '{output_file}'.")
         message = f"log_feedback,Log Processed Succesfully"
+        send_to_pixhawk("Log Processed Succesfully",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     except subprocess.CalledProcessError as e:
         print(f"Error running rnx2rtkp: {e}")
@@ -494,6 +565,7 @@ def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_reco
     if data.empty:
         print("No valid data to plot.")
         message = f"log_feedback,No valid data to plot"
+        send_to_pixhawk("No valid data to plot",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
         return None,None
@@ -558,6 +630,7 @@ def listen_for_commands():
                 if message == "start":
                     if is_running:
                         feedback = "log_feedback,Log is already running"
+                        send_to_pixhawk("Log is already running",0)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                         print(feedback)
                     else:
@@ -567,6 +640,7 @@ def listen_for_commands():
                 elif message == "stop":
                     if not is_running:
                         feedback = "log_feedback,Log is not running"
+                        send_to_pixhawk("Log is not running",0)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                         print(feedback)
                     else:
@@ -580,12 +654,14 @@ def listen_for_commands():
                         ws.send(json_payload)
                         print("Reboot command sent:", json_payload)
                         feedback = "log_feedback,Emlid is rebooting"
+                        send_to_pixhawk("Emlid is rebooting",0)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                     except Exception as e:
                         print("Error sending reboot command:", e)
                 elif message == "copy":
                     if log_start_time == None:
                         feedback = "log_feedback,Log is not available for copy"
+                        send_to_pixhawk("Log is not available for copy",0)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                         print(feedback)
                     else:
@@ -673,6 +749,7 @@ def on_message(ws, message):
                     if Compressing_log_name != None:
                         print(f"{Compressing_log_name} is ready to download")
                         message = f"log_feedback,compressing {Compressing_log_name} completed"
+                        send_to_pixhawk(f"Compressing {Compressing_log_name} completed",0)
                         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                         process_log(Compressing_log_name)
                     else:
@@ -712,6 +789,7 @@ def send_ping(ws, interval=6):
 def on_open(ws):
     print("Connection opened")
     message = "log_feedback,Emlid Connected"
+    send_to_pixhawk("Emlid Connected",0)
     udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     threading.Thread(target=send_ping, args=(ws,), daemon=True).start()
 
@@ -827,6 +905,10 @@ def main():
     finally:
         udp_sock.close()
         print("UDP socket closed.")
+    
+    connection = establish_connection(retries=5, delay=2)
+    if connection is None:
+        print("Exiting program due to failed connection.")
 
 if __name__ == "__main__":
     main()
