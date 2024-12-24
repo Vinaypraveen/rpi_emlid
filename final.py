@@ -82,7 +82,6 @@ def send_to_pixhawk(message: str, severity: int):
     except Exception as e:
         print(f"Error while sending message: {e}")
 
-
 def establish_connection(retries=5, delay=2):
     """
     Establish a connection to the Pixhawk via serial with retries.
@@ -153,10 +152,10 @@ def perform_post_request(started):
         response = requests.post(post_url, json=post_payload)
         if response.status_code == 200:
             if started:
-                log_feedback = "Logging started successfully"
+                log_feedback = "Logging started"
                 send_to_pixhawk(log_feedback,0)
             else:
-                log_feedback = "Logging stopped successfully"
+                log_feedback = "Logging stopped"
                 send_to_pixhawk(log_feedback,0)
             return f"log_feedback, {log_feedback}"
         
@@ -181,7 +180,7 @@ def get_log_by_name(log_name, timeout=30):
             if elapsed_time > timeout:
                 print(f"Timeout reached: Could not find log '{log_name}' within {timeout} seconds.")
                 message = f"log_feedback,Timeout reached: Log '{log_name}' not found."
-                send_to_pixhawk(f"Timeout reached: Log '{log_name}' not found",0)
+                send_to_pixhawk(f"Log not found",0)
                 udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                 return None
 
@@ -194,7 +193,7 @@ def get_log_by_name(log_name, timeout=30):
             for log_entry in logs_data:
                 if log_entry['name'] == log_name:
                     message = f"log_feedback,Downloading Log : {log_entry['name']}"
-                    send_to_pixhawk(f"Downloading Log : {log_entry['name']}",0)
+                    send_to_pixhawk(f"Downloading Log",0)
                     udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                     return log_entry
 
@@ -416,7 +415,6 @@ def download_log_resumable(log_entry, destination_dir):
         print(f"\n\nLog file '{log_name}' downloaded successfully")
         print(f"Total download time: {end_time - start_time:.2f} seconds")
         message = f"Total download time: {end_time - start_time:.2f} seconds"
-        send_to_pixhawk(message,0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         time.sleep(1)
         # Extract the ZIP file
@@ -454,7 +452,7 @@ def run_rnx2rtkp_command(rinex_files, output_dir, log_name):
         subprocess.run(command, check=True)
         print(f"rnx2rtkp done at '{output_file}'.")
         message = f"log_feedback,Log Processed Succesfully"
-        send_to_pixhawk("Log Processed Succesfully",0)
+        send_to_pixhawk("Log Processed",0)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     except subprocess.CalledProcessError as e:
         print(f"Error running rnx2rtkp: {e}")
@@ -749,7 +747,6 @@ def on_message(ws, message):
                     if Compressing_log_name != None:
                         print(f"{Compressing_log_name} is ready to download")
                         message = f"log_feedback,compressing {Compressing_log_name} completed"
-                        send_to_pixhawk(f"Compressing {Compressing_log_name} completed",0)
                         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                         process_log(Compressing_log_name)
                     else:
