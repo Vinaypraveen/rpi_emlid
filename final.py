@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import pytz
 import shutil
 from pymavlink import mavutil
+import serial
 
 ws_url = "ws://192.168.2.15/socket.io/?EIO=3&transport=websocket"
 android_ip = "192.168.144.100"
@@ -28,7 +29,17 @@ archive_name_global = None
 Compressing_log_name = None
 generated_image_path = None
 log_start_time = None
+
+Payload_Serial_Port = '/dev/ttyUSB0'
+Payload_Baud_Rate = 115200
+Payload_connection = None
 connection = None
+
+Mission_download_alt = 15
+Shutter_alt = 10
+
+payload_lock = threading.Lock()
+connection_lock = threading.Lock()
 
 app = Flask(__name__)
 destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
@@ -56,13 +67,48 @@ reboot_payload = [
             }
         ]
 
-def send_to_pixhawk(message: str, severity: int):
-    """
-    Sends a message to the Pixhawk with a specified severity level.
+def listen_to_arduino():
+    global Payload_connection, archive_name_global, destination_dir
+    try:
+        while True:
+            with payload_lock:  # Ensure thread-safe access
+                if Payload_connection and Payload_connection.in_waiting > 0:
+                    data = Payload_connection.readline().decode('utf-8').strip()
+                    if data.startswith("Timestamp:"):
+                        # Decode the message
+                        is_running = check_logging_status()
+                        if is_running and archive_name_global:
+                            temp_file_name = archive_name_global.replace(".zip", "")
+                            temp_file_name = f"{temp_file_name}_rotational_values.txt"
+                            temp_file_path = os.path.join(destination_dir, temp_file_name)
+                            decoded_values = decode_arduino_message(data)
+                            if decoded_values:
+                                timestamp = decoded_values.get("Timestamp")
+                                yaw = decoded_values.get("Yaw")
+                                roll = decoded_values.get("Roll")
+                                pitch = decoded_values.get("Pitch")
+                                with open(temp_file_path, "a") as temp_file:
+                                    temp_file.write(f"Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}\n")
+                                print(f"Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
+            time.sleep(0.1)  # Reduce CPU usage
+    except Exception as e:
+        print(f"Error in listener thread: {e}")
 
-    :param message: The message to send.
-    :param severity: Severity level (0 - Emergency, 7 - Debug).
-    """
+def decode_arduino_message(message):
+    try:
+        values = {}
+        parts = message.split(",")
+        for part in parts:
+            key, value = part.split(":")
+            key = key.strip()
+            value = float(value.strip()) if key != "Timestamp" else int(value.strip())
+            values[key] = value
+        return values
+    except Exception as e:
+        print(f"Failed to decode message: {message}. Error: {e}")
+        return None
+
+def send_to_pixhawk(message: str, severity: int):
     global connection
     try:
         # Check if the connection is valid
@@ -82,19 +128,55 @@ def send_to_pixhawk(message: str, severity: int):
     except Exception as e:
         print(f"Error while sending message: {e}")
 
+def send_command(command):
+    global Payload_connection
+    try:
+        with payload_lock:  # Ensure thread-safe access
+            if Payload_connection and Payload_connection.is_open:
+                print(f"Sending: {command}")
+                Payload_connection.write((command + "\n").encode())
+                time.sleep(0.1)
+                response = Payload_connection.readline().decode('utf-8').strip()
+                print(f"Payload Response: {response}")
+                return response
+            else:
+                print("Payload connection not available. Attempting to re-establish...")
+                Payload_connection = establish_Payload_connection()
+                if Payload_connection and Payload_connection.is_open:
+                    print("Reconnected successfully. Retrying command...")
+                    Payload_connection.write((command + "\n").encode())
+                    time.sleep(0.1)
+                    response = Payload_connection.readline().decode('utf-8').strip()
+                    print(f"Payload Response after reconnect: {response}")
+                    return response
+                else:
+                    print("Failed to re-establish payload connection.")
+    except serial.SerialException as e:
+        print(f"Serial error: {e}")
+    return None
+
+def establish_Payload_connection(retries=3, delay=2):
+    global Payload_connection, Payload_Serial_Port, Payload_Baud_Rate
+    for attempt in range(retries):
+        try:
+            print(f"Attempt {attempt + 1}/{retries} to connect to payload...")
+            Payload_connection = serial.Serial(Payload_Serial_Port, Payload_Baud_Rate, timeout=1)
+            if Payload_connection.is_open:
+                print(f"Connected to {Payload_Serial_Port} at {Payload_Baud_Rate} baud")
+                return Payload_connection
+        except Exception as e:
+            print(f"Failed to connect on attempt {attempt + 1}: {e}")
+        time.sleep(delay)
+    print("Reconnection failed after multiple attempts.")
+    return None
+
 def establish_connection(retries=5, delay=2):
-    """
-    Establish a connection to the Pixhawk via serial with retries.
-    
-    :param retries: Number of retry attempts.
-    :param delay: Delay between retries in seconds.
-    :return: mavutil.mavlink_connection object if successful, None otherwise.
-    """
     global connection
     for attempt in range(1, retries + 1):
         try:
             print(f"Attempt {attempt} to connect...")
-            connection = mavutil.mavlink_connection("/dev/ttyAMA0", baud=115200, source_system=1)
+            #connection = mavutil.mavlink_connection("/dev/ttyAMA0", baud=115200, source_system=1)
+            connection = mavutil.mavlink_connection("udp:192.168.0.181:14550", source_system=1)
             print("Waiting for heartbeat...")
             connection.wait_heartbeat()
             print(f"Heartbeat received from system (system {connection.target_system}, component {connection.target_component})")
@@ -107,6 +189,44 @@ def establish_connection(retries=5, delay=2):
             else:
                 print("All connection attempts failed.")
     return None
+
+def find_last_206_waypoint(mission_items):
+    last_206_waypoint = None
+    for item in mission_items:
+        if item.command == 206:  # Camera trigger command
+            last_206_waypoint = item.seq
+            last_206_waypoint = last_206_waypoint + 1
+    return last_206_waypoint
+
+def download_mission(connection, retries=3):
+    print("Downloading mission...")
+    connection.mav.mission_request_list_send(connection.target_system, connection.target_component)
+    msg = connection.recv_match(type="MISSION_COUNT", blocking=True, timeout=5)
+    
+    if not msg:
+        print("Failed to get mission count.")
+        return []
+
+    mission_count = msg.count
+    print(f"Mission count received: {mission_count} waypoints.")
+    waypoints = []
+
+    for i in range(mission_count):
+        for attempt in range(retries):
+            connection.mav.mission_request_send(connection.target_system, connection.target_component, i)
+            msg = connection.recv_match(type="MISSION_ITEM", blocking=True, timeout=2)
+            
+            if msg:
+                waypoints.append(msg)
+                print(f"Waypoint {msg.seq} received: Command {msg.command}.")
+                break
+            else:
+                print(f"Retrying waypoint {i} (Attempt {attempt + 1}/{retries})...")
+        else:
+            print(f"Failed to download waypoint {i} after {retries} attempts.")
+
+    print(f"Downloaded {len(waypoints)} of {mission_count} waypoints.")
+    return waypoints
 
 @app.route('/download_image', methods=['GET'])
 def download_image():
@@ -207,9 +327,7 @@ def get_log_by_name(log_name, timeout=30):
 
 def process_log(Compressing_log_name):
     print(Compressing_log_name)
-    global generated_image_path
-    global destination_dir
-    global log_start_time
+    global generated_image_path, log_start_time, destination_dir
 
     if Compressing_log_name.startswith("Reach_"):
         date_time_str = Compressing_log_name.split("Reach_")[1]
@@ -231,6 +349,19 @@ def process_log(Compressing_log_name):
     else:
         print("Invalid log name format.")
         return
+
+    # Handle the temporary file
+    temp_file_name = f"{Compressing_log_name}_rotational_values.txt"
+    temp_file_path = os.path.join("/home/vinlee/Desktop/Emlid_log_files", temp_file_name)
+    
+    # Check if the temporary file exists
+    if os.path.exists(temp_file_path):
+        # Move the file (cut and paste)
+        destination_path = os.path.join(time_folder, temp_file_name)
+        shutil.move(temp_file_path, destination_path)
+        print(f"Moved {temp_file_name} to {destination_path}")
+    else:
+        print(f"Temporary file {temp_file_name} not found.")
 
     log_name = Compressing_log_name + ".zip"
     log_entry = get_log_by_name(log_name)
@@ -500,6 +631,14 @@ def find_rinex_files(directory):
                     rinex_files["24O"] = os.path.join(root, file)
                 elif file.endswith(".24P"):
                     rinex_files["24P"] = os.path.join(root, file)
+    #Delete UBX File
+    if ubx_file:
+        if os.path.exists(ubx_file):
+            # Delete the file
+            os.remove(ubx_file)
+            print(f"File {ubx_file} has been deleted.")
+        else:
+            print(f"The file {ubx_file} does not exist.")
 
     if rinex_files["24O"]:
         print(f"Found .24O file: {rinex_files['24O']}")
@@ -854,9 +993,6 @@ def check_http_status(url):
         return False
 
 def wait_for_conditions(ip_list, url, retry_interval=3):
-    """
-    Wait until all IPs respond to ping and the given URL returns a 200 status code.
-    """
     while True:
         # Check ping for all IPs
         all_ips_success = all(ping_ip(ip) for ip in ip_list)
@@ -876,7 +1012,135 @@ def wait_for_conditions(ip_list, url, retry_interval=3):
 
         time.sleep(retry_interval)
 
+def start_or_stop_logging(message):
+    is_running = check_logging_status()
+    if message == "start":
+        if is_running:
+            feedback = "log_feedback,Log is already running"
+            send_to_pixhawk("Log is already running", 0)
+            udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
+            print(feedback)
+        else:
+            feedback = perform_post_request(started=True)
+            udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
+            print(feedback)
+    elif message == "stop":
+        if not is_running:
+            feedback = "log_feedback,Log is not running"
+            send_to_pixhawk("Log is not running", 0)
+            udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
+            print(feedback)
+        else:
+            feedback = perform_post_request(started=False)
+            udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
+            print(feedback)
+
+def monitor_drone(connection):
+    global Mission_download_alt, Shutter_alt
+    print("Starting drone monitoring...")
+    mission_downloaded = False
+    logging_stopped = False  # Track if "Logging Stopped" action is already performed
+    waypoints = []
+    last_206_wp = None
+    armed = False  # Initialize armed with a default value
+    last_armed = None  # Track armed state
+    last_altitude = -1  # Track altitude state
+    flight_mode = None  # Initialize flight_mode to track the current mode
+    last_flight_mode = None  # Track the last flight mode
+    shutter_state = None  # Track camera shutter state
+
+    while True:
+        try:
+            # Use connection_lock to safely access the connection object
+            with connection_lock:
+                msg = connection.recv_match(blocking=True)
+            
+            if not msg:
+                continue
+
+            if msg.get_type() == "HEARTBEAT":
+                armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
+                flight_mode = connection.flightmode  # Update flight mode here
+
+                if armed != last_armed:
+                    if armed:
+                        print("Drone is armed.")
+                        start_or_stop_logging("start")
+                        print("Logging Started")
+                    else:
+                        print("Drone is disarmed.")
+                    last_armed = armed
+
+                if flight_mode != last_flight_mode:
+                    print(f"Flight mode changed to: {flight_mode}")
+                    last_flight_mode = flight_mode
+
+                if flight_mode == "RTL":
+                    print("Return to Launch mode detected.")
+
+            elif msg.get_type() == "GLOBAL_POSITION_INT":
+                altitude = msg.relative_alt / 1000.0  # Convert to meters
+
+                if altitude != last_altitude:
+                    if armed:
+                        if altitude < Shutter_alt - 1 and shutter_state != "closed":
+                            print("Camera Shutter Closed")
+                            send_command("SERVO:CLOSE")
+                            shutter_state = "closed"
+                        elif altitude >= Shutter_alt + 1 and shutter_state != "opened":
+                            print("Camera Shutter Opened")
+                            send_command("SERVO:OPEN")
+                            shutter_state = "opened"
+
+                        if altitude > Mission_download_alt and not mission_downloaded:
+                            with connection_lock:
+                                waypoints = download_mission(connection)
+                            last_206_wp = find_last_206_waypoint(waypoints)
+                            if last_206_wp is not None:
+                                print(f"Last waypoint with command 206: {last_206_wp}")
+                            else:
+                                print("No waypoint with command 206 found.")
+                            mission_downloaded = True
+
+                        if mission_downloaded and last_206_wp:
+                            with connection_lock:
+                                msg = connection.recv_match(type="MISSION_CURRENT", blocking=True, timeout=1)
+                            if msg and last_206_wp is not None and msg.seq > last_206_wp:
+                                if not logging_stopped:
+                                    start_or_stop_logging("stop")
+                                    print("Logging Stopped")
+                                    logging_stopped = True  # Prevent repeated "Logging Stopped" messages
+                    elif not armed and shutter_state != "opened":
+                        time.sleep(10)
+                        print("Camera Shutter Opened")  # Open shutter when disarmed
+                        send_command("SERVO:OPEN")
+                        shutter_state = "opened"
+                    last_altitude = altitude
+
+        except Exception as e:
+            # Log the exception and continue the loop
+            print(f"Error in monitor_drone: {e}")
+            time.sleep(1)  # Prevent tight loops in case of repeated errors
+
+def start_websocket():
+    global ws
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_close=on_close,
+        on_error=on_error
+    )
+    while True:
+        try:
+            ws.run_forever()
+        except Exception as e:
+            print(f"WebSocket error: {e}")
+            time.sleep(5)  # Retry after delay
+
 def main():
+    global Payload_connection,connection
+
     ip_addresses = ["192.168.144.20", "192.168.2.15"]
     print("Checking connectivity to required IPs...")
     wait_for_conditions(ip_addresses, post_url)
@@ -886,26 +1150,25 @@ def main():
     listener_thread.start()
     flask_thread.start()
 
-    global ws
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_open=on_open,
-        on_message=on_message,
-        on_close=on_close,
-        on_error=on_error
-    )
-
-    try:
-        ws.run_forever()
-    except KeyboardInterrupt:
-        print("Exiting...")
-    finally:
-        udp_sock.close()
-        print("UDP socket closed.")
-    
-    connection = establish_connection(retries=5, delay=2)
+    connection = establish_connection(retries=10, delay=10)
     if connection is None:
         print("Exiting program due to failed connection.")
+    
+    Payload_connection = establish_Payload_connection()
+
+    if connection:
+        drone_monitor_thread = threading.Thread(target=monitor_drone, args=(connection,), daemon=True)
+        drone_monitor_thread.start()
+
+        payload_listener_thread = threading.Thread(target=listen_to_arduino, daemon=True)
+        payload_listener_thread.start()
+
+    websocket_thread = threading.Thread(target=start_websocket, daemon=True)
+    websocket_thread.start()
+
+    print("Main thread is now idle, running auxiliary tasks.")
+    while True:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
