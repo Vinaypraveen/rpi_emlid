@@ -16,6 +16,7 @@ import pytz
 import shutil
 from pymavlink import mavutil
 import serial
+import RPi.GPIO as GPIO
 
 ws_url = "ws://192.168.2.15/socket.io/?EIO=3&transport=websocket"
 android_ip = "192.168.144.100"
@@ -30,19 +31,40 @@ Compressing_log_name = None
 generated_image_path = None
 log_start_time = None
 
-Payload_Serial_Port = '/dev/ttyUSB0'
+# Servo configuration
+SERVO_PIN = 18
+PWM_FREQUENCY = 50  # 50Hz PWM frequency
+shutter_open = 2400  # Max PWM value in microseconds
+shutter_close = 700  # Min PWM value in microseconds
+
+# Initialize GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+pwm = GPIO.PWM(SERVO_PIN, PWM_FREQUENCY)
+pwm.start(0)
+
+Payload_Serial_Port = '/dev/ttyAMA0'
 Payload_Baud_Rate = 115200
+
+Pixhawk_Port = "/dev/ttyACM0"
+Pixhawk_Baud_Rate = 115200
+
 Payload_connection = None
 connection = None
 
-Mission_download_alt = 15
+Mission_download_alt = 20
 Shutter_alt = 10
 
 payload_lock = threading.Lock()
 connection_lock = threading.Lock()
 
+serial_number = 1  # Initialize serial number
+current_file_name = None  # Track the current file name
+image_taken_at = None
+
 app = Flask(__name__)
 destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
+
 if not os.path.exists(destination_dir):
     os.makedirs(destination_dir)
 
@@ -67,30 +89,83 @@ reboot_payload = [
             }
         ]
 
+def set_servo(position):
+    #set_servo("open")
+    #set_servo("close")
+    try:
+        if position == "open":
+            duty_cycle = (shutter_open / 20000.0) * 100  # Convert microseconds to duty cycle
+        elif position == "close":
+            duty_cycle = (shutter_close / 20000.0) * 100  # Convert microseconds to duty cycle
+        else:
+            print("Invalid position. Use 'open' or 'close'.")
+            return
+        pwm.ChangeDutyCycle(duty_cycle)
+        time.sleep(1)  # Allow servo to stabilize
+        pwm.ChangeDutyCycle(0)  # Stop sending PWM to reduce jitter
+    except Exception as e:
+        print(f"Error: {e}")
+
 def listen_to_arduino():
-    global Payload_connection, archive_name_global, destination_dir
+    global Payload_connection, archive_name_global, destination_dir, connection, serial_number, current_file_name,image_taken_at
     try:
         while True:
             with payload_lock:  # Ensure thread-safe access
                 if Payload_connection and Payload_connection.in_waiting > 0:
                     data = Payload_connection.readline().decode('utf-8').strip()
                     if data.startswith("Timestamp:"):
-                        # Decode the message
+                        # Immediately fetch the heading from Pixhawk
+                        heading = None
+                        if connection is not None:
+                            try:
+                                msg = connection.recv_match(type="ATTITUDE", blocking=True, timeout=0.1)
+                                if msg:
+                                    heading = msg.yaw * 180 / 3.14159  # Convert radians to degrees
+                            except Exception as e:
+                                print(f"Error fetching heading from Pixhawk: {e}")
+                        
                         is_running = check_logging_status()
+                        if image_taken_at:
+                            print("image Captured")
+                            send_to_pixhawk("Image Captured",0)
+                            image_taken_at = None
+
                         if is_running and archive_name_global:
-                            temp_file_name = archive_name_global.replace(".zip", "")
-                            temp_file_name = f"{temp_file_name}_rotational_values.txt"
-                            temp_file_path = os.path.join(destination_dir, temp_file_name)
+                            # Decode the Arduino message
                             decoded_values = decode_arduino_message(data)
                             if decoded_values:
                                 timestamp = decoded_values.get("Timestamp")
                                 yaw = decoded_values.get("Yaw")
                                 roll = decoded_values.get("Roll")
                                 pitch = decoded_values.get("Pitch")
+                                
+                                # Prepare the file for writing
+                                temp_file_name = archive_name_global.replace(".zip", "")
+                                temp_file_name = f"{temp_file_name}_rotational_values.txt"
+                                temp_file_path = os.path.join(destination_dir, temp_file_name)
+
+                                # Check if the file name has changed
+                                if current_file_name != temp_file_name:
+                                    current_file_name = temp_file_name
+                                    serial_number = 1  # Reset serial number for the new file
+
+                                # Create file with header if it doesn't exist
+                                if not os.path.exists(temp_file_path):
+                                    with open(temp_file_path, "w") as temp_file:
+                                        temp_file.write("Serial Number,Timestamp,Pitch,Roll,Yaw,Heading\n")
+
+                                # Write data to the file
                                 with open(temp_file_path, "a") as temp_file:
-                                    temp_file.write(f"Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}\n")
-                                print(f"Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
-            time.sleep(0.1)  # Reduce CPU usage
+                                    if heading is not None:
+                                        # Write with heading
+                                        temp_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw},{heading:.2f}\n")
+                                        print(f"Serial: {serial_number}, Timestamp: {timestamp}, Heading: {heading:.2f}")
+                                    else:
+                                        # Write without heading (original IMU values)
+                                        temp_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw}\n")
+                                        print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
+                                    serial_number += 1  # Increment serial number
+            time.sleep(0.05)  # Reduce CPU usage
     except Exception as e:
         print(f"Error in listener thread: {e}")
 
@@ -109,6 +184,22 @@ def decode_arduino_message(message):
         return None
 
 def send_to_pixhawk(message: str, severity: int):
+    """
+    Sends a message to the Pixhawk via MAVLink with a specified severity.
+
+    Severity levels:
+    0: Emergency   - System is unusable (shows pop-up in QGC)
+    1: Alert       - Immediate action required (shows pop-up in QGC)
+    2: Critical    - Critical conditions (shows pop-up in QGC)
+    3: Error       - Error conditions (shows pop-up in QGC)
+    4: Warning     - Warning conditions (may show pop-up in QGC)
+    5: Notice      - Normal but significant condition
+    6: Info        - Informational message
+    7: Debug       - Debug-level messages (not typically shown in QGC)
+    Severity Levels 0-3 (Emergency, Alert, Critical, Error): These levels display pop-up notifications in QGC, ensuring the operator is immediately aware of serious issues.
+    Severity Level 4 (Warning): May display a pop-up in QGC, depending on the message and configuration.
+    Severity Levels 5-7 (Notice, Info, Debug): Typically used for less critical or informational messages, not always shown prominently in QGC.
+    """
     global connection
     try:
         # Check if the connection is valid
@@ -128,34 +219,7 @@ def send_to_pixhawk(message: str, severity: int):
     except Exception as e:
         print(f"Error while sending message: {e}")
 
-def send_command(command):
-    global Payload_connection
-    try:
-        with payload_lock:  # Ensure thread-safe access
-            if Payload_connection and Payload_connection.is_open:
-                print(f"Sending: {command}")
-                Payload_connection.write((command + "\n").encode())
-                time.sleep(0.1)
-                response = Payload_connection.readline().decode('utf-8').strip()
-                print(f"Payload Response: {response}")
-                return response
-            else:
-                print("Payload connection not available. Attempting to re-establish...")
-                Payload_connection = establish_Payload_connection()
-                if Payload_connection and Payload_connection.is_open:
-                    print("Reconnected successfully. Retrying command...")
-                    Payload_connection.write((command + "\n").encode())
-                    time.sleep(0.1)
-                    response = Payload_connection.readline().decode('utf-8').strip()
-                    print(f"Payload Response after reconnect: {response}")
-                    return response
-                else:
-                    print("Failed to re-establish payload connection.")
-    except serial.SerialException as e:
-        print(f"Serial error: {e}")
-    return None
-
-def establish_Payload_connection(retries=3, delay=2):
+def establish_Payload_connection(retries=5, delay=5):
     global Payload_connection, Payload_Serial_Port, Payload_Baud_Rate
     for attempt in range(retries):
         try:
@@ -170,13 +234,14 @@ def establish_Payload_connection(retries=3, delay=2):
     print("Reconnection failed after multiple attempts.")
     return None
 
-def establish_connection(retries=5, delay=2):
+def establish_connection(retries=5, delay=5):
     global connection
     for attempt in range(1, retries + 1):
         try:
             print(f"Attempt {attempt} to connect...")
-            #connection = mavutil.mavlink_connection("/dev/ttyAMA0", baud=115200, source_system=1)
-            connection = mavutil.mavlink_connection("udp:192.168.0.181:14550", source_system=1)
+            connection = mavutil.mavlink_connection(Pixhawk_Port, Pixhawk_Baud_Rate, source_system=1)
+            #connection = mavutil.mavlink_connection("udp:192.168.0.181:14550", source_system=1)
+            connection = mavutil.mavlink_connection()
             print("Waiting for heartbeat...")
             connection.wait_heartbeat()
             print(f"Heartbeat received from system (system {connection.target_system}, component {connection.target_component})")
@@ -1039,88 +1104,121 @@ def monitor_drone(connection):
     global Mission_download_alt, Shutter_alt
     print("Starting drone monitoring...")
     mission_downloaded = False
-    logging_stopped = False  # Track if "Logging Stopped" action is already performed
+    logging_stopped = not check_logging_status()
     waypoints = []
     last_206_wp = None
     armed = False  # Initialize armed with a default value
-    last_armed = None  # Track armed state
-    last_altitude = -1  # Track altitude state
+    last_armed = True  # Track armed state
     flight_mode = None  # Initialize flight_mode to track the current mode
     last_flight_mode = None  # Track the last flight mode
-    shutter_state = None  # Track camera shutter state
+    shutter_state = "opened"  # Track camera shutter state
+    retries = 1
 
     while True:
         try:
             # Use connection_lock to safely access the connection object
             with connection_lock:
-                msg = connection.recv_match(blocking=True)
-            
-            if not msg:
-                continue
-
-            if msg.get_type() == "HEARTBEAT":
-                armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
-                flight_mode = connection.flightmode  # Update flight mode here
-
-                if armed != last_armed:
-                    if armed:
-                        print("Drone is armed.")
-                        start_or_stop_logging("start")
-                        print("Logging Started")
+                if connection:
+                    msg = connection.recv_match(blocking=True, timeout=1)
+                    
+                    if not msg:
+                        continue
                     else:
-                        print("Drone is disarmed.")
-                    last_armed = armed
-
-                if flight_mode != last_flight_mode:
-                    print(f"Flight mode changed to: {flight_mode}")
-                    last_flight_mode = flight_mode
-
-                if flight_mode == "RTL":
-                    print("Return to Launch mode detected.")
-
-            elif msg.get_type() == "GLOBAL_POSITION_INT":
-                altitude = msg.relative_alt / 1000.0  # Convert to meters
-
-                if altitude != last_altitude:
-                    if armed:
-                        if altitude < Shutter_alt - 1 and shutter_state != "closed":
-                            print("Camera Shutter Closed")
-                            send_command("SERVO:CLOSE")
-                            shutter_state = "closed"
-                        elif altitude >= Shutter_alt + 1 and shutter_state != "opened":
-                            print("Camera Shutter Opened")
-                            send_command("SERVO:OPEN")
-                            shutter_state = "opened"
-
-                        if altitude > Mission_download_alt and not mission_downloaded:
-                            with connection_lock:
-                                waypoints = download_mission(connection)
-                            last_206_wp = find_last_206_waypoint(waypoints)
-                            if last_206_wp is not None:
-                                print(f"Last waypoint with command 206: {last_206_wp}")
-                            else:
-                                print("No waypoint with command 206 found.")
-                            mission_downloaded = True
-
-                        if mission_downloaded and last_206_wp:
-                            with connection_lock:
-                                msg = connection.recv_match(type="MISSION_CURRENT", blocking=True, timeout=1)
-                            if msg and last_206_wp is not None and msg.seq > last_206_wp:
-                                if not logging_stopped:
+                        if msg.get_type() == "HEARTBEAT":
+                            armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
+                            flight_mode = connection.flightmode
+                            if flight_mode and flight_mode != last_flight_mode:
+                                print(f"Flight mode changed to: {flight_mode}")
+                                if flight_mode == "RTL":
+                                    print("Return to Launch mode detected.")
+                                    last_flight_mode = flight_mode  
+                        
+                        elif msg.get_type() == "GLOBAL_POSITION_INT":
+                            altitude = int(msg.relative_alt / 1000.0)
+                            if armed:
+                                if altitude < Shutter_alt - 1 and shutter_state != "closed":
+                                    print("Camera Shutter Closed")
+                                    set_servo("close")
+                                    shutter_state = "closed"
+                                    time.sleep(1)
+                                elif altitude >= Shutter_alt + 1 and shutter_state != "opened":
+                                    print("Camera Shutter Opened")
+                                    set_servo("open")
+                                    shutter_state = "opened"
+                                    time.sleep(2)
+                                    trigger_camera()
+                                
+                                if altitude > Mission_download_alt and not mission_downloaded and retries < 3:
+                                    waypoints = download_mission(connection)
+                                    last_206_wp = find_last_206_waypoint(waypoints)
+                                    if last_206_wp is not None:
+                                        print(f"Last waypoint with command 206: {last_206_wp}")
+                                        mission_downloaded = True
+                                        retries = 3
+                                    else:
+                                        print("No waypoint with command 206 found.")
+                                        retries += 1
+                        
+                        elif msg.get_type() == "MISSION_CURRENT":
+                            if last_206_wp:
+                                if msg.seq > last_206_wp and logging_stopped == False:
                                     start_or_stop_logging("stop")
                                     print("Logging Stopped")
-                                    logging_stopped = True  # Prevent repeated "Logging Stopped" messages
-                    elif not armed and shutter_state != "opened":
-                        time.sleep(10)
-                        print("Camera Shutter Opened")  # Open shutter when disarmed
-                        send_command("SERVO:OPEN")
-                        shutter_state = "opened"
-                    last_altitude = altitude
+                                    logging_stopped = True
+
+            if armed != last_armed:
+                if armed:
+                    print("Drone armed. Closing shutter and starting logging...")
+                    set_servo("close")
+                    print("Camera Shutter Closed")                                    
+                    shutter_state = "closed"
+                    if logging_stopped:                             
+                        start_or_stop_logging("start")
+                        logging_stopped = False
+                        print("Logging Started")
+                else:
+                    print("Drone disarmed. Opening shutter and stopping logging...")
+                    if logging_stopped == False:
+                        start_or_stop_logging("stop")
+                        print("Logging Stopped")
+                        logging_stopped = True
+                    print("Camera Shutter Opened")
+                    shutter_state = "opened"
+                    retries = 1
+                    time.sleep(5)
+                    set_servo("open")
+                last_armed = armed
 
         except Exception as e:
             # Log the exception and continue the loop
-            print(f"Error in monitor_drone: {e}")
+            print(f"Error in monitor_drone: {type(e).__name__}: {e}")
             time.sleep(1)  # Prevent tight loops in case of repeated errors
+
+def trigger_camera(relay_num=0):
+    global image_taken_at
+    image_taken_at = int(time.time())
+    print(f"Activating relay {relay_num}...")
+    connection.mav.command_long_send(
+        connection.target_system,
+        connection.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_RELAY,
+        0,    # Confirmation
+        relay_num,  # Relay number
+        1,    # Relay state (1 = ON)
+        0, 0, 0, 0, 0  # Unused parameters
+    )
+    print(f"Relay {relay_num} activated.")
+    time.sleep(0.1)
+    connection.mav.command_long_send(
+        connection.target_system,
+        connection.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_RELAY,
+        0,    # Confirmation
+        relay_num,  # Relay number
+        0,    # Relay state (0 = OFF)
+        0, 0, 0, 0, 0  # Unused parameters
+    )
+    print(f"Image Captured")
 
 def start_websocket():
     global ws
@@ -1141,7 +1239,7 @@ def start_websocket():
 def main():
     global Payload_connection,connection
 
-    ip_addresses = ["192.168.144.20", "192.168.2.15"]
+    ip_addresses = ["192.168.144.20"]
     print("Checking connectivity to required IPs...")
     wait_for_conditions(ip_addresses, post_url)
 
@@ -1168,7 +1266,7 @@ def main():
 
     print("Main thread is now idle, running auxiliary tasks.")
     while True:
-        time.sleep(1)
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
