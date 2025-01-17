@@ -14,9 +14,9 @@ import simplekml
 from datetime import datetime, timedelta, timezone
 import pytz
 import shutil
-from pymavlink import mavutil
 import serial
 import RPi.GPIO as GPIO
+from dronekit import connect,Command
 
 ws_url = "ws://192.168.2.15/socket.io/?EIO=3&transport=websocket"
 android_ip = "192.168.144.100"
@@ -34,7 +34,7 @@ log_start_time = None
 # Servo configuration
 SERVO_PIN = 18
 PWM_FREQUENCY = 50  # 50Hz PWM frequency
-shutter_open = 2400  # Max PWM value in microseconds
+shutter_open = 2550  # Max PWM value in microseconds
 shutter_close = 700  # Min PWM value in microseconds
 
 # Initialize GPIO
@@ -46,17 +46,16 @@ pwm.start(0)
 Payload_Serial_Port = '/dev/ttyAMA0'
 Payload_Baud_Rate = 115200
 
-Pixhawk_Port = "/dev/ttyACM0"
+Pixhawk_Port = '/dev/ttyACM0'
 Pixhawk_Baud_Rate = 115200
 
 Payload_connection = None
 connection = None
 
-Mission_download_alt = 20
-Shutter_alt = 10
+Mission_download_alt = 8
+Shutter_alt = 4
 
 payload_lock = threading.Lock()
-connection_lock = threading.Lock()
 
 serial_number = 1  # Initialize serial number
 current_file_name = None  # Track the current file name
@@ -110,62 +109,59 @@ def listen_to_arduino():
     global Payload_connection, archive_name_global, destination_dir, connection, serial_number, current_file_name,image_taken_at
     try:
         while True:
-            with payload_lock:  # Ensure thread-safe access
-                if Payload_connection and Payload_connection.in_waiting > 0:
-                    data = Payload_connection.readline().decode('utf-8').strip()
-                    if data.startswith("Timestamp:"):
-                        # Immediately fetch the heading from Pixhawk
-                        heading = None
-                        if connection is not None:
-                            try:
-                                msg = connection.recv_match(type="ATTITUDE", blocking=True, timeout=0.1)
-                                if msg:
-                                    heading = msg.yaw * 180 / 3.14159  # Convert radians to degrees
-                            except Exception as e:
-                                print(f"Error fetching heading from Pixhawk: {e}")
-                        
-                        is_running = check_logging_status()
-                        if image_taken_at:
-                            print("image Captured")
-                            send_to_pixhawk("Image Captured",0)
-                            image_taken_at = None
+            if Payload_connection and Payload_connection.in_waiting > 0:
+                data = Payload_connection.readline().decode('utf-8').strip()
+                if data.startswith("Timestamp:"):
+                    print(data)
+                    # Immediately fetch the heading from Pixhawk
+                    heading = None
+                    if connection is not None:
+                        try:
+                            heading = connection.heading
+                        except Exception as e:
+                            print(f"Error fetching heading from Pixhawk: {e}")
+                    
+                    if image_taken_at:
+                        print("image Captured")
+                        send_to_pixhawk("Image Captured",5)
+                        image_taken_at = None
 
-                        if is_running and archive_name_global:
-                            # Decode the Arduino message
-                            decoded_values = decode_arduino_message(data)
-                            if decoded_values:
-                                timestamp = decoded_values.get("Timestamp")
-                                yaw = decoded_values.get("Yaw")
-                                roll = decoded_values.get("Roll")
-                                pitch = decoded_values.get("Pitch")
-                                
-                                # Prepare the file for writing
-                                temp_file_name = archive_name_global.replace(".zip", "")
-                                temp_file_name = f"{temp_file_name}_rotational_values.txt"
-                                temp_file_path = os.path.join(destination_dir, temp_file_name)
+                    if archive_name_global:
+                        # Decode the Arduino message
+                        decoded_values = decode_arduino_message(data)
+                        if decoded_values:
+                            timestamp = decoded_values.get("Timestamp")
+                            yaw = decoded_values.get("Yaw")
+                            roll = decoded_values.get("Roll")
+                            pitch = decoded_values.get("Pitch")
+                            
+                            # Prepare the file for writing
+                            temp_file_name = archive_name_global.replace(".zip", "")
+                            temp_file_name = f"{temp_file_name}_rotational_values.txt"
+                            temp_file_path = os.path.join(destination_dir, temp_file_name)
 
-                                # Check if the file name has changed
-                                if current_file_name != temp_file_name:
-                                    current_file_name = temp_file_name
-                                    serial_number = 1  # Reset serial number for the new file
+                            # Check if the file name has changed
+                            if current_file_name != temp_file_name:
+                                current_file_name = temp_file_name
+                                serial_number = 1  # Reset serial number for the new file
 
-                                # Create file with header if it doesn't exist
-                                if not os.path.exists(temp_file_path):
-                                    with open(temp_file_path, "w") as temp_file:
-                                        temp_file.write("Serial Number,Timestamp,Pitch,Roll,Yaw,Heading\n")
+                            # Create file with header if it doesn't exist
+                            if not os.path.exists(temp_file_path):
+                                with open(temp_file_path, "w") as temp_file:
+                                    temp_file.write("Serial Number,Timestamp,Pitch,Roll,Yaw,Heading\n")
 
-                                # Write data to the file
-                                with open(temp_file_path, "a") as temp_file:
-                                    if heading is not None:
-                                        # Write with heading
-                                        temp_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw},{heading:.2f}\n")
-                                        print(f"Serial: {serial_number}, Timestamp: {timestamp}, Heading: {heading:.2f}")
-                                    else:
-                                        # Write without heading (original IMU values)
-                                        temp_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw}\n")
-                                        print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
-                                    serial_number += 1  # Increment serial number
-            time.sleep(0.05)  # Reduce CPU usage
+                            # Write data to the file
+                            with open(temp_file_path, "a") as temp_file:
+                                if heading is not None:
+                                    # Write with heading
+                                    temp_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw},{heading:.2f}\n")
+                                    print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}, Heading: {heading:.2f}")
+                                else:
+                                    # Write without heading (original IMU values)
+                                    temp_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw}\n")
+                                    print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
+                                serial_number += 1  # Increment serial number
+            time.sleep(0.01)  # Reduce CPU usage
     except Exception as e:
         print(f"Error in listener thread: {e}")
 
@@ -188,34 +184,41 @@ def send_to_pixhawk(message: str, severity: int):
     Sends a message to the Pixhawk via MAVLink with a specified severity.
 
     Severity levels:
-    0: Emergency   - System is unusable (shows pop-up in QGC)
-    1: Alert       - Immediate action required (shows pop-up in QGC)
-    2: Critical    - Critical conditions (shows pop-up in QGC)
-    3: Error       - Error conditions (shows pop-up in QGC)
-    4: Warning     - Warning conditions (may show pop-up in QGC)
-    5: Notice      - Normal but significant condition
-    6: Info        - Informational message
-    7: Debug       - Debug-level messages (not typically shown in QGC)
-    Severity Levels 0-3 (Emergency, Alert, Critical, Error): These levels display pop-up notifications in QGC, ensuring the operator is immediately aware of serious issues.
-    Severity Level 4 (Warning): May display a pop-up in QGC, depending on the message and configuration.
-    Severity Levels 5-7 (Notice, Info, Debug): Typically used for less critical or informational messages, not always shown prominently in QGC.
+    0: Emergency   - shows pop-up in QGC & voice prompt
+    1: Alert       - shows pop-up in QGC & voice prompt
+    2: Critical    - shows pop-up in QGC & voice prompt
+    3: Error       - shows pop-up in QGC & voice prompt
+    4: Warning     - shows pop-up in QGC & voice prompt
+    5: Notice      - only voice prompt
+    6: Info        - just in logs
+    7: Debug       - just in logs
     """
-    global connection
-    try:
-        # Check if the connection is valid
-        if connection is None:
-            print("Connection is not established. Attempting to reconnect...")
-            connection = establish_connection(retries=3, delay=2)
-            if connection is None:
-                print("Failed to reconnect. Cannot send the message.")
-                return
+    global connection  # Ensure 'vehicle' is available globally
 
-        # Send message if severity is valid
-        if 0 <= severity <= 7:
-            connection.mav.statustext_send(severity, message.encode('utf-8'))
-            print(f"Message sent: '{message}' with severity {severity}")
-        else:
+    try:
+        # Check if the vehicle connection is valid
+        if connection is None:
+            print("Vehicle connection is not established or not ready.")
+            establish_connection(retries=10, delay=10)
+            send_to_pixhawk(message, severity)
+            return
+
+        if not (0 <= severity <= 7):
             print("Invalid severity level. Must be between 0 (Emergency) and 7 (Debug).")
+            return
+
+        if len(message) > 50:
+            print(f"Message is too long. Truncating to 50 characters: {message[:50]}")
+            message = message[:50]
+
+        msg = connection.message_factory.statustext_encode(
+            severity,                # Severity level
+            message.encode('utf-8')  # Message string (encoded in UTF-8)
+        )
+        connection.send_mavlink(msg)
+        connection.flush()  # Ensure the message is sent immediately
+        print(f"Message sent: '{message}' with severity {severity}")
+
     except Exception as e:
         print(f"Error while sending message: {e}")
 
@@ -238,14 +241,12 @@ def establish_connection(retries=5, delay=5):
     global connection
     for attempt in range(1, retries + 1):
         try:
-            print(f"Attempt {attempt} to connect...")
-            connection = mavutil.mavlink_connection(Pixhawk_Port, Pixhawk_Baud_Rate, source_system=1)
-            #connection = mavutil.mavlink_connection("udp:192.168.0.181:14550", source_system=1)
-            connection = mavutil.mavlink_connection()
-            print("Waiting for heartbeat...")
-            connection.wait_heartbeat()
-            print(f"Heartbeat received from system (system {connection.target_system}, component {connection.target_component})")
-            return connection
+            print(f"Connecting to vehicle on: /dev/ttyACM0, Attempt {attempt}")
+            connection = connect('/dev/ttyACM0', wait_ready=True, baud=921600,source_system=1,timeout=60)
+            time.sleep(5)
+            if connection:
+                print("connected")
+                return connection
         except Exception as e:
             print(f"Connection attempt {attempt} failed: {e}")
             if attempt < retries:
@@ -254,44 +255,6 @@ def establish_connection(retries=5, delay=5):
             else:
                 print("All connection attempts failed.")
     return None
-
-def find_last_206_waypoint(mission_items):
-    last_206_waypoint = None
-    for item in mission_items:
-        if item.command == 206:  # Camera trigger command
-            last_206_waypoint = item.seq
-            last_206_waypoint = last_206_waypoint + 1
-    return last_206_waypoint
-
-def download_mission(connection, retries=3):
-    print("Downloading mission...")
-    connection.mav.mission_request_list_send(connection.target_system, connection.target_component)
-    msg = connection.recv_match(type="MISSION_COUNT", blocking=True, timeout=5)
-    
-    if not msg:
-        print("Failed to get mission count.")
-        return []
-
-    mission_count = msg.count
-    print(f"Mission count received: {mission_count} waypoints.")
-    waypoints = []
-
-    for i in range(mission_count):
-        for attempt in range(retries):
-            connection.mav.mission_request_send(connection.target_system, connection.target_component, i)
-            msg = connection.recv_match(type="MISSION_ITEM", blocking=True, timeout=2)
-            
-            if msg:
-                waypoints.append(msg)
-                print(f"Waypoint {msg.seq} received: Command {msg.command}.")
-                break
-            else:
-                print(f"Retrying waypoint {i} (Attempt {attempt + 1}/{retries})...")
-        else:
-            print(f"Failed to download waypoint {i} after {retries} attempts.")
-
-    print(f"Downloaded {len(waypoints)} of {mission_count} waypoints.")
-    return waypoints
 
 @app.route('/download_image', methods=['GET'])
 def download_image():
@@ -338,20 +301,20 @@ def perform_post_request(started):
         if response.status_code == 200:
             if started:
                 log_feedback = "Logging started"
-                send_to_pixhawk(log_feedback,0)
+                send_to_pixhawk(log_feedback,5)
             else:
                 log_feedback = "Logging stopped"
-                send_to_pixhawk(log_feedback,0)
+                send_to_pixhawk(log_feedback,5)
             return f"log_feedback, {log_feedback}"
         
         else:
             print(f"Failed to update logging. HTTP {response.status_code}")
-            send_to_pixhawk("Failed to update logging",0)
+            send_to_pixhawk("Failed to update logging",3)
             return "log_feedback,Failed to update logging"
         
     except requests.exceptions.RequestException as e:
         print("Error performing POST request:", e)
-        send_to_pixhawk("Error updating logging status",0)
+        send_to_pixhawk("Error updating logging status",3)
         return "log_feedback,Error updating logging status"
 
 def get_log_by_name(log_name, timeout=30):
@@ -365,7 +328,7 @@ def get_log_by_name(log_name, timeout=30):
             if elapsed_time > timeout:
                 print(f"Timeout reached: Could not find log '{log_name}' within {timeout} seconds.")
                 message = f"log_feedback,Timeout reached: Log '{log_name}' not found."
-                send_to_pixhawk(f"Log not found",0)
+                send_to_pixhawk(f"Log not found",3)
                 udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                 return None
 
@@ -378,9 +341,10 @@ def get_log_by_name(log_name, timeout=30):
             for log_entry in logs_data:
                 if log_entry['name'] == log_name:
                     message = f"log_feedback,Downloading Log : {log_entry['name']}"
-                    send_to_pixhawk(f"Downloading Log",0)
+                    send_to_pixhawk(f"Downloading Log",6)
                     udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                     return log_entry
+            time.sleep(0.1)
 
         except requests.exceptions.RequestException as e:
             print(f"Error fetching logs: {e}. Retrying in {retry_interval} seconds...")
@@ -436,7 +400,7 @@ def process_log(Compressing_log_name):
     extract_to_dir,Log_IST_start_time,Log_recording_time,log_name = download_log_resumable(log_entry, time_folder)
     if not extract_to_dir:
         message = f"log_feedback,Downloaded File is Corrupted"
-        send_to_pixhawk("Downloaded File is Corrupted",0)
+        send_to_pixhawk("Downloaded File is Corrupted",3)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
@@ -449,7 +413,7 @@ def process_log(Compressing_log_name):
             generated_image_path = image_path  # Update the global path
             time.sleep(1)
             message = f"log_feedback,Download the Image"
-            send_to_pixhawk("Download the Image",0)
+            send_to_pixhawk("Download the Image",5)
             udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
             print(f"Image path updated to: {generated_image_path}")
             time.sleep(2)
@@ -464,14 +428,14 @@ def copy_to_pendrive(log_start_time):
     if not os.path.exists(time_folder):
         print(f"Source folder does not exist: {time_folder}")
         message = f"log_feedback,Source folder does not exist"
-        send_to_pixhawk("Source folder does not exist",0)
+        send_to_pixhawk("Source folder does not exist",3)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
     if not pendrive_path:
         print("Pendrive path not detected. Aborting copy process.")
         message = f"log_feedback,Pendrive not attached"
-        send_to_pixhawk("Pendrive not attached",0)
+        send_to_pixhawk("Pendrive not attached",3)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
@@ -491,12 +455,12 @@ def copy_to_pendrive(log_start_time):
 
         print(f"Files copied to pendrive at: {pendrive_target}")
         message = f"log_feedback,Log saved to Pendrive"
-        send_to_pixhawk("Log saved to Pendrive",0)
+        send_to_pixhawk("Log saved to Pendrive",5)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     except Exception as e:
         print(f"Error copying files to pendrive: {e}")
         message = f"log_feedback,Error saving to Pendrive"
-        send_to_pixhawk("Error saving to Pendrive",0)
+        send_to_pixhawk("Error saving to Pendrive",3)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
 def pendrive__check_and_copy_path():
@@ -648,7 +612,7 @@ def run_rnx2rtkp_command(rinex_files, output_dir, log_name):
         subprocess.run(command, check=True)
         print(f"rnx2rtkp done at '{output_file}'.")
         message = f"log_feedback,Log Processed Succesfully"
-        send_to_pixhawk("Log Processed",0)
+        send_to_pixhawk("Log Processed",6)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     except subprocess.CalledProcessError as e:
         print(f"Error running rnx2rtkp: {e}")
@@ -767,7 +731,7 @@ def process_positions_and_generate_outputs(file_path,Log_IST_start_time,Log_reco
     if data.empty:
         print("No valid data to plot.")
         message = f"log_feedback,No valid data to plot"
-        send_to_pixhawk("No valid data to plot",0)
+        send_to_pixhawk("No valid data to plot",3)
         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
         return None,None
@@ -832,7 +796,7 @@ def listen_for_commands():
                 if message == "start":
                     if is_running:
                         feedback = "log_feedback,Log is already running"
-                        send_to_pixhawk("Log is already running",0)
+                        send_to_pixhawk("Log is already running",5)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                         print(feedback)
                     else:
@@ -842,7 +806,7 @@ def listen_for_commands():
                 elif message == "stop":
                     if not is_running:
                         feedback = "log_feedback,Log is not running"
-                        send_to_pixhawk("Log is not running",0)
+                        send_to_pixhawk("Log is not running",5)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                         print(feedback)
                     else:
@@ -856,18 +820,19 @@ def listen_for_commands():
                         ws.send(json_payload)
                         print("Reboot command sent:", json_payload)
                         feedback = "log_feedback,Emlid is rebooting"
-                        send_to_pixhawk("Emlid is rebooting",0)
+                        send_to_pixhawk("Emlid is rebooting",5)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                     except Exception as e:
                         print("Error sending reboot command:", e)
                 elif message == "copy":
                     if log_start_time == None:
                         feedback = "log_feedback,Log is not available for copy"
-                        send_to_pixhawk("Log is not available for copy",0)
+                        send_to_pixhawk("Log is not available for copy",5)
                         udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
                         print(feedback)
                     else:
                         copy_to_pendrive(log_start_time)
+            time.sleep(0.01)
 
     except Exception as e:
         print(f"Error in listener: {e}")
@@ -964,6 +929,7 @@ def on_message(ws, message):
                         print(f"Name: {Compressing_log_name}, Progress: {progress}")
                         message = f"log_feedback,Compressing log : {Compressing_log_name}, Progress: {progress} %"
                         udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+        time.sleep(0.1)
 
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         pass
@@ -974,6 +940,7 @@ def start_flask_server():
     while True:
         try:
             app.run(host="192.168.144.20", port=5000, debug=False)
+            #time.sleep(0.2)
         except Exception as e:
             print(f"Flask server encountered an error: {e}")
             print("Retrying to start Flask server...")
@@ -990,7 +957,7 @@ def send_ping(ws, interval=6):
 def on_open(ws):
     print("Connection opened")
     message = "log_feedback,Emlid Connected"
-    send_to_pixhawk("Emlid Connected",0)
+    send_to_pixhawk("Emlid Connected",5)
     udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
     threading.Thread(target=send_ping, args=(ws,), daemon=True).start()
 
@@ -1022,6 +989,7 @@ def retry_connection():
                 on_close=on_close,
                 on_error=on_error
             )
+            time.sleep(1)
             ws.run_forever()
             print("Reconnected successfully!")
             return  # Exit retry loop if connection is successful
@@ -1082,7 +1050,7 @@ def start_or_stop_logging(message):
     if message == "start":
         if is_running:
             feedback = "log_feedback,Log is already running"
-            send_to_pixhawk("Log is already running", 0)
+            send_to_pixhawk("Log is already running", 5)
             udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
             print(feedback)
         else:
@@ -1092,7 +1060,7 @@ def start_or_stop_logging(message):
     elif message == "stop":
         if not is_running:
             feedback = "log_feedback,Log is not running"
-            send_to_pixhawk("Log is not running", 0)
+            send_to_pixhawk("Log is not running", 5)
             udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
             print(feedback)
         else:
@@ -1100,125 +1068,38 @@ def start_or_stop_logging(message):
             udp_sock.sendto(feedback.encode('utf-8'), (android_ip, android_port))
             print(feedback)
 
-def monitor_drone(connection):
-    global Mission_download_alt, Shutter_alt
-    print("Starting drone monitoring...")
-    mission_downloaded = False
-    logging_stopped = not check_logging_status()
-    waypoints = []
-    last_206_wp = None
-    armed = False  # Initialize armed with a default value
-    last_armed = True  # Track armed state
-    flight_mode = None  # Initialize flight_mode to track the current mode
-    last_flight_mode = None  # Track the last flight mode
-    shutter_state = "opened"  # Track camera shutter state
-    retries = 1
-
-    while True:
-        try:
-            # Use connection_lock to safely access the connection object
-            with connection_lock:
-                if connection:
-                    msg = connection.recv_match(blocking=True, timeout=1)
-                    
-                    if not msg:
-                        continue
-                    else:
-                        if msg.get_type() == "HEARTBEAT":
-                            armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
-                            flight_mode = connection.flightmode
-                            if flight_mode and flight_mode != last_flight_mode:
-                                print(f"Flight mode changed to: {flight_mode}")
-                                if flight_mode == "RTL":
-                                    print("Return to Launch mode detected.")
-                                    last_flight_mode = flight_mode  
-                        
-                        elif msg.get_type() == "GLOBAL_POSITION_INT":
-                            altitude = int(msg.relative_alt / 1000.0)
-                            if armed:
-                                if altitude < Shutter_alt - 1 and shutter_state != "closed":
-                                    print("Camera Shutter Closed")
-                                    set_servo("close")
-                                    shutter_state = "closed"
-                                    time.sleep(1)
-                                elif altitude >= Shutter_alt + 1 and shutter_state != "opened":
-                                    print("Camera Shutter Opened")
-                                    set_servo("open")
-                                    shutter_state = "opened"
-                                    time.sleep(2)
-                                    trigger_camera()
-                                
-                                if altitude > Mission_download_alt and not mission_downloaded and retries < 3:
-                                    waypoints = download_mission(connection)
-                                    last_206_wp = find_last_206_waypoint(waypoints)
-                                    if last_206_wp is not None:
-                                        print(f"Last waypoint with command 206: {last_206_wp}")
-                                        mission_downloaded = True
-                                        retries = 3
-                                    else:
-                                        print("No waypoint with command 206 found.")
-                                        retries += 1
-                        
-                        elif msg.get_type() == "MISSION_CURRENT":
-                            if last_206_wp:
-                                if msg.seq > last_206_wp and logging_stopped == False:
-                                    start_or_stop_logging("stop")
-                                    print("Logging Stopped")
-                                    logging_stopped = True
-
-            if armed != last_armed:
-                if armed:
-                    print("Drone armed. Closing shutter and starting logging...")
-                    set_servo("close")
-                    print("Camera Shutter Closed")                                    
-                    shutter_state = "closed"
-                    if logging_stopped:                             
-                        start_or_stop_logging("start")
-                        logging_stopped = False
-                        print("Logging Started")
-                else:
-                    print("Drone disarmed. Opening shutter and stopping logging...")
-                    if logging_stopped == False:
-                        start_or_stop_logging("stop")
-                        print("Logging Stopped")
-                        logging_stopped = True
-                    print("Camera Shutter Opened")
-                    shutter_state = "opened"
-                    retries = 1
-                    time.sleep(5)
-                    set_servo("open")
-                last_armed = armed
-
-        except Exception as e:
-            # Log the exception and continue the loop
-            print(f"Error in monitor_drone: {type(e).__name__}: {e}")
-            time.sleep(1)  # Prevent tight loops in case of repeated errors
-
-def trigger_camera(relay_num=0):
+def trigger_camera(vehicle, relay_num=0):
     global image_taken_at
     image_taken_at = int(time.time())
+    
+    # Turn the relay ON
     print(f"Activating relay {relay_num}...")
-    connection.mav.command_long_send(
-        connection.target_system,
-        connection.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_RELAY,
+    vehicle.message_factory.command_long_send(
+        vehicle._master.target_system,  # Target system
+        vehicle._master.target_component,  # Target component
+        181,  # MAV_CMD_DO_SET_RELAY
         0,    # Confirmation
         relay_num,  # Relay number
         1,    # Relay state (1 = ON)
         0, 0, 0, 0, 0  # Unused parameters
     )
     print(f"Relay {relay_num} activated.")
+    
+    # Wait a short time
     time.sleep(0.1)
-    connection.mav.command_long_send(
-        connection.target_system,
-        connection.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_RELAY,
+    
+    # Turn the relay OFF
+    print(f"Deactivating relay {relay_num}...")
+    vehicle.message_factory.command_long_send(
+        vehicle._master.target_system,  # Target system
+        vehicle._master.target_component,  # Target component
+        181,  # MAV_CMD_DO_SET_RELAY
         0,    # Confirmation
         relay_num,  # Relay number
         0,    # Relay state (0 = OFF)
         0, 0, 0, 0, 0  # Unused parameters
     )
-    print(f"Image Captured")
+    print(f"Image Captured.")
 
 def start_websocket():
     global ws
@@ -1232,41 +1113,124 @@ def start_websocket():
     while True:
         try:
             ws.run_forever()
+            time.sleep(0.5)
         except Exception as e:
             print(f"WebSocket error: {e}")
             time.sleep(5)  # Retry after delay
 
+def monitor_drone():
+    global Mission_download_alt, Shutter_alt, connection
+
+    connection = establish_connection(retries=5, delay=5)
+
+    print("Starting drone monitoring...")
+    mission_downloaded = False
+    logging_stopped = not check_logging_status()
+    last_206_wp = None
+    armed = False
+    last_armed = True
+    shutter_state = "opened"
+    retries = 1
+
+    while True:
+        try:
+            if connection:
+                armed = connection.armed
+                altitude = max(int(connection.location.global_relative_frame.alt), 0)
+                current_waypoint = connection.commands.next
+                #print(f"Armed: {armed}, altitude: {altitude}")
+                time.sleep(0.1)
+                
+                if armed:
+                    if altitude < Shutter_alt - 1 and shutter_state != "closed":
+                        print("Camera Shutter Closed")
+                        set_servo("close")
+                        shutter_state = "closed"
+                        time.sleep(1)
+                    elif altitude >= Shutter_alt + 1 and shutter_state != "opened":
+                        print("Camera Shutter Opened")
+                        set_servo("open")
+                        shutter_state = "opened"
+                        time.sleep(2)
+                        trigger_camera()
+
+                    if altitude > Mission_download_alt and not mission_downloaded and retries < 3:
+                        connection.commands.download()
+                        connection.commands.wait_ready()
+
+                        for index, cmd in enumerate(connection.commands):
+                            if cmd.command == 206:  # MAV_CMD_DO_DIGICAM_CONTROL (or similar camera trigger command)
+                                last_206_wp = index + 1  # Index is 0-based, waypoints are typically 1-based
+                        if last_206_wp is not None:
+                            print(f"Last waypoint with command 206: {last_206_wp-1}")
+                            send_to_pixhawk(f"last camera waypoint is {last_206_wp-1}",4)
+                            mission_downloaded = True
+                            retries = 3
+                        else:
+                            print("No waypoint with command 206 found.")
+                            retries += 1             
+
+                    if last_206_wp:
+                        if current_waypoint > last_206_wp and logging_stopped == False:
+                            start_or_stop_logging("stop")
+                            print("Logging Stopped")
+                            logging_stopped = True
+
+                if armed != last_armed:
+                    print("Hellooooooo")
+                    if armed:
+                        print("Drone armed. Closing shutter and starting logging...")
+                        set_servo("close")                                   
+                        shutter_state = "closed"
+                        if logging_stopped:                             
+                            start_or_stop_logging("start")
+                            logging_stopped = False
+                            print("Logging Started")
+                    else:
+                        print("Drone disarmed. Opening shutter and stopping logging...")
+                        if logging_stopped == False:
+                            start_or_stop_logging("stop")
+                            print("Logging Stopped")
+                            logging_stopped = True
+                        print("Camera Shutter Opened")
+                        shutter_state = "opened"
+                        time.sleep(5)
+                        set_servo("open")
+                    last_armed = armed
+            time.sleep(0.1)
+
+        except Exception as e:
+            # Log the exception and continue the loop
+            print(f"Error in monitor_drone: {type(e).__name__}: {e}")
+            time.sleep(1)  # Prevent tight loops in case of repeated errors
+
 def main():
     global Payload_connection,connection
-
-    ip_addresses = ["192.168.144.20"]
+    ip_addresses = ["192.168.144.20","192.168.2.15"]
     print("Checking connectivity to required IPs...")
     wait_for_conditions(ip_addresses, post_url)
 
-    listener_thread = threading.Thread(target=listen_for_commands, daemon=True)
-    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
-    listener_thread.start()
-    flask_thread.start()
-
-    connection = establish_connection(retries=10, delay=10)
-    if connection is None:
-        print("Exiting program due to failed connection.")
-    
     Payload_connection = establish_Payload_connection()
 
-    if connection:
-        drone_monitor_thread = threading.Thread(target=monitor_drone, args=(connection,), daemon=True)
-        drone_monitor_thread.start()
-
-        payload_listener_thread = threading.Thread(target=listen_to_arduino, daemon=True)
-        payload_listener_thread.start()
-
+    listener_thread = threading.Thread(target=listen_for_commands, daemon=True)
+    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
     websocket_thread = threading.Thread(target=start_websocket, daemon=True)
-    websocket_thread.start()
+    drone_monitor_thread = threading.Thread(target=monitor_drone, daemon=True)
+    payload_listener_thread = threading.Thread(target=listen_to_arduino, daemon=True)
 
-    print("Main thread is now idle, running auxiliary tasks.")
+    drone_monitor_thread.start()
+    time.sleep(3)
+    listener_thread.start()
+    flask_thread.start()
+    websocket_thread.start()
+    payload_listener_thread.start()
+    time.sleep(3)
+
+    print("Main thread is now running")
+
     while True:
         time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
