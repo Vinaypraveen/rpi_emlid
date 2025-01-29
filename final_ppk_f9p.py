@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
 import RPi.GPIO as GPIO
 import shutil
+from flask import Flask, send_file
+import socket
 
 # Serial Ports
 UBX_PORT = "/dev/ttyACM2"
@@ -33,6 +35,8 @@ Shutter_alt = 4
 serial_number = 1
 image_taken_at = None
 
+generated_image_path = None
+
 destination_dir = "/home/vinlee/Desktop/Emlid_log_files"
 
 Payload_Serial_Port = '/dev/ttyAMA0'
@@ -47,6 +51,47 @@ pwm.start(0)
 
 if not os.path.exists(destination_dir):
     os.makedirs(destination_dir)
+
+android_ip = "192.168.144.100"
+android_port = 14552
+listener_port = 14553
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+app = Flask(__name__)
+@app.route('/download_image', methods=['GET'])
+def download_image():
+    global generated_image_path
+    
+    # Retry mechanism to check for hardware reconnection
+    retries = 3  # Number of retries before failing
+    retry_delay = 2  # Delay between retries (in seconds)
+
+    while retries > 0:
+        if generated_image_path and os.path.exists(generated_image_path):
+            # Extract the original filename
+            original_filename = os.path.basename(generated_image_path)
+            # Add Content-Disposition header to specify the filename
+            return send_file(
+                generated_image_path,
+                as_attachment=True,
+                download_name=original_filename  # Ensure filename is passed in the header
+            )
+        else:
+            print("Image not available or path is invalid. Retrying...")
+            time.sleep(retry_delay)
+            retries -= 1
+
+    # After retries, return an error if the image is still not available
+    return "Image not available yet or path is invalid.", 404
+
+def start_flask_server():
+    # Retry mechanism to handle hardware disconnection
+    while True:
+        try:
+            app.run(host="192.168.144.20", port=5000, debug=False)
+        except Exception as e:
+            print(f"Flask server encountered an error: {e}")
+            print("Retrying to start Flask server...")
 
 def set_servo(position):
     #set_servo("open")
@@ -186,10 +231,14 @@ def listen_to_arduino():
                                     # Write with heading
                                     RV_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw},{heading:.2f}\n")
                                     print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}, Heading: {heading:.2f}")
+                                    message = f"log_feedback,S: {serial_number}, T: {timestamp}, Y: {yaw}, R: {roll}, P: {pitch},H: {heading:.2f}"
+                                    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                                 else:
                                     # Write without heading (original IMU values)
                                     RV_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw}\n")
                                     print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
+                                    message = f"log_feedback,S: {serial_number}, T: {timestamp}, Y: {yaw}, R: {roll}, P: {pitch}"
+                                    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                                 serial_number += 1  # Increment serial number
             time.sleep(0.05)  # Reduce CPU usage
     except Exception as e:
@@ -361,15 +410,19 @@ def log_ubx_data(log_filename):
 def monitor_arming():
     """Monitors Pixhawk arming status and starts/stops UBX logging."""
     global is_armed, log_thread, current_ubx_file,vehicle,image_taken_at
+
     shutter_state = "opened"
     log_status = False
     mission_downloaded = False
     retries = 1
     last_206_wp = None
+
     try:
         vehicle = dronekit.connect(PIXHAWK_PORT, baud=PIXHAWK_BAUD, wait_ready=True,source_system=1,timeout=60)
         print("[INFO] Monitoring Pixhawk arming status...")
         send_to_pixhawk("System Ready" , 5)
+        message = f"log_feedback,System Ready"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
         while True:
             altitude = max(int(vehicle.location.global_relative_frame.alt), 0)
@@ -383,6 +436,8 @@ def monitor_arming():
                     log_thread.start()
                     print("[INFO] UBX Logging Started")
                     send_to_pixhawk("Logging Started",4)
+                    message = f"log_feedback,Logging started successfully"
+                    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                     log_status = True
                 if shutter_state == "opened":
                     set_servo("close")
@@ -395,6 +450,8 @@ def monitor_arming():
                         log_thread.join()
                     print("[INFO] UBX Logging Stopped")
                     send_to_pixhawk("Logging Stopped",4)
+                    message = f"log_feedback,Logging stopped successfully"
+                    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                     log_status == False
                 if shutter_state == "closed":
                     time.sleep(3)
@@ -429,6 +486,8 @@ def monitor_arming():
                             log_thread.join()
                             print("[INFO] UBX Logging Stopped")
                             send_to_pixhawk("Logging Stopped",4)
+                            message = f"log_feedback,Logging stopped successfully"
+                            udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
                             log_status == False
                         if current_ubx_file:
                             process_ubx_file(current_ubx_file,log_start_time)
@@ -536,6 +595,7 @@ def calculate_time_difference(file_path):
 
 def process_events_pos(file_path,log_start_time,output_pos):
     """Processes _events.pos to generate CSV, PNG, and KML."""
+    global generated_image_path
     
     base_filename = os.path.basename(file_path).replace('_events.pos', '')
     output_csv_path = os.path.join(os.path.dirname(file_path), f"{base_filename}.csv")
@@ -570,6 +630,8 @@ def process_events_pos(file_path,log_start_time,output_pos):
 
     if data.empty:
         print("No valid data to plot.")
+        message = f"log_feedback,No valid data to plot"
+        udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
         return
 
     Log_recording_time = calculate_time_difference(output_pos)
@@ -588,9 +650,12 @@ def process_events_pos(file_path,log_start_time,output_pos):
     plt.scatter(longitudes, latitudes, s=4, color='red')
     plt.title(f"{base_filename} Position Plot", fontsize=20, weight='bold')
     plt.title(
-        f"{base_filename} , IMAGE COUNT : {len(latitudes)}\nDate & Time: {log_start_time}   Recording Time: {Log_recording_time}",
-        fontsize=20,
-        weight='bold'
+    f"{base_filename} , IMAGE COUNT : {len(latitudes)}\n"
+    f"Date: {log_start_time.strftime('%d-%m-%Y')}, "
+    f"Time: {log_start_time.strftime('%I:%M:%S')}   "
+    f"Recording Time: {Log_recording_time}",
+    fontsize=20,
+    weight='bold'
     )
     plt.xlabel("Longitude", fontsize=12)
     plt.ylabel("Latitude", fontsize=12)
@@ -617,6 +682,9 @@ def process_events_pos(file_path,log_start_time,output_pos):
     print(f"KML saved to: {output_kml_path}")
     send_to_pixhawk("Log succesfully processed",5)
     copy_to_pendrive(log_start_time)
+    generated_image_path = output_image_path
+    message = f"log_feedback,Download the Image"
+    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
 
 if __name__ == "__main__":
     print("[INFO] Waiting for valid UTC time from NMEA...")
@@ -636,6 +704,8 @@ if __name__ == "__main__":
     print("[INFO] Time synchronized. Starting program...")
     Payload_connection = establish_Payload_connection()
     payload_listener_thread = threading.Thread(target=listen_to_arduino, daemon=True)
+    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
+    flask_thread.start()
     payload_listener_thread.start()
     time.sleep(1)
     # Step 2: Start monitoring Pixhawk arming status
