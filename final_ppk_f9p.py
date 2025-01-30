@@ -441,22 +441,22 @@ def monitor_arming():
                     log_status = True
                 if shutter_state == "opened":
                     set_servo("close")
-                    shutter_state == "closed"
+                    shutter_state = "closed"
 
             elif not vehicle.armed and is_armed:
                 is_armed = False
                 if log_status:
                     if log_thread and log_thread.is_alive():
-                        log_thread.join()
+                        log_thread.join(timeout=5)
                     print("[INFO] UBX Logging Stopped")
                     send_to_pixhawk("Logging Stopped",4)
                     message = f"log_feedback,Logging stopped successfully"
                     udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
-                    log_status == False
+                    log_status = False
                 if shutter_state == "closed":
                     time.sleep(3)
                     set_servo("open")
-                    shutter_state == "open"
+                    shutter_state = "open"
 
                 # Process UBX file with convbin & rnx2rtkp
                 if current_ubx_file:
@@ -483,12 +483,12 @@ def monitor_arming():
                 if last_206_wp and mission_downloaded:
                     if current_waypoint > last_206_wp and log_status == True:
                         if log_thread and log_thread.is_alive():
-                            log_thread.join()
+                            log_thread.join(timeout=5)
                             print("[INFO] UBX Logging Stopped")
                             send_to_pixhawk("Logging Stopped",4)
                             message = f"log_feedback,Logging stopped successfully"
                             udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
-                            log_status == False
+                            log_status = False
                         if current_ubx_file:
                             process_ubx_file(current_ubx_file,log_start_time)
                 
