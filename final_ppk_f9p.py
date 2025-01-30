@@ -232,13 +232,17 @@ def listen_to_arduino():
                                     RV_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw},{heading:.2f}\n")
                                     print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}, Heading: {heading:.2f}")
                                     message = f"log_feedback,S: {serial_number}, T: {timestamp}, Y: {yaw}, R: {roll}, P: {pitch},H: {heading:.2f}"
-                                    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+                                    message_to_pixhawk = f"S: {serial_number}, T: {timestamp}, Y: {yaw}, R: {roll}, P: {pitch},H: {heading:.2f}"
                                 else:
                                     # Write without heading (original IMU values)
                                     RV_file.write(f"{serial_number},{timestamp},{pitch},{roll},{yaw}\n")
                                     print(f"Serial: {serial_number}, Timestamp: {timestamp}, Yaw: {yaw}, Roll: {roll}, Pitch: {pitch}")
                                     message = f"log_feedback,S: {serial_number}, T: {timestamp}, Y: {yaw}, R: {roll}, P: {pitch}"
-                                    udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+                                    message_to_pixhawk = f"S: {serial_number}, T: {timestamp}, Y: {yaw}, R: {roll}, P: {pitch}"
+                                
+                                udp_sock.sendto(message.encode('utf-8'), (android_ip, android_port))
+                                if serial_number % 20 == 0:
+                                    send_to_pixhawk(message_to_pixhawk, 6)
                                 serial_number += 1  # Increment serial number
             time.sleep(0.05)  # Reduce CPU usage
     except Exception as e:
